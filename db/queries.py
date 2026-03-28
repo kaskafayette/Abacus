@@ -65,11 +65,15 @@ def get_source_label(conn: sqlite3.Connection, prefix: str) -> str | None:
     return row["source_label"] if row else None
 
 
-def upsert_source_file_map(conn: sqlite3.Connection, prefix: str, label: str) -> None:
+def upsert_source_file_map(conn: sqlite3.Connection, prefix: str, label: str,
+                           nickname: str | None = None,
+                           account_type: str | None = None) -> None:
     conn.execute(
-        "INSERT INTO source_file_map (source_prefix, source_label) VALUES (?, ?) "
-        "ON CONFLICT (source_prefix) DO UPDATE SET source_label = excluded.source_label",
-        (prefix, label),
+        "INSERT INTO source_file_map (source_prefix, source_label, nickname, account_type) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT (source_prefix) DO UPDATE SET source_label = excluded.source_label, "
+        "nickname = excluded.nickname, account_type = excluded.account_type",
+        (prefix, label, nickname, account_type),
     )
     conn.commit()
 
@@ -194,10 +198,10 @@ def insert_transactions(conn: sqlite3.Connection, rows: list[dict]) -> None:
     conn.executemany(
         "INSERT INTO transactions "
         "(date, amount, check_number, description_raw, category_raw, payee, via, payor, "
-        "category, subcategory, tax_flags, note, source, status, overridden) "
+        "category, subcategory, tax_flags, note, order_ref, source, status, overridden) "
         "VALUES (:date, :amount, :check_number, :description_raw, :category_raw, "
         ":payee, :via, :payor, :category, :subcategory, :tax_flags, :note, "
-        ":source, :status, :overridden)",
+        ":order_ref, :source, :status, :overridden)",
         rows,
     )
     conn.commit()
@@ -216,7 +220,8 @@ def get_pending_count(conn: sqlite3.Connection) -> int:
 
 def get_transactions(conn: sqlite3.Connection, start_date: str | None = None,
                      end_date: str | None = None, source: str | None = None,
-                     search: str | None = None, status: str | None = None) -> list[sqlite3.Row]:
+                     search: str | None = None, search_payee: str | None = None,
+                     status: str | None = None) -> list[sqlite3.Row]:
     """Flexible transaction query with optional filters."""
     clauses = []
     params = []
@@ -232,10 +237,17 @@ def get_transactions(conn: sqlite3.Connection, start_date: str | None = None,
     if status:
         clauses.append("status = ?")
         params.append(status)
+    if search_payee:
+        clauses.append("payee LIKE ?")
+        params.append(f"%{search_payee}%")
     if search:
-        clauses.append("(payee LIKE ? OR description_raw LIKE ? OR note LIKE ?)")
+        clauses.append(
+            "(payee LIKE ? OR description_raw LIKE ? OR note LIKE ? "
+            "OR category LIKE ? OR subcategory LIKE ? OR tax_flags LIKE ? "
+            "OR source LIKE ? OR via LIKE ? OR payor LIKE ?)"
+        )
         term = f"%{search}%"
-        params.extend([term, term, term])
+        params.extend([term] * 9)
 
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     return conn.execute(

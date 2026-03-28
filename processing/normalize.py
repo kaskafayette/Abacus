@@ -228,7 +228,6 @@ SEED_NORMALIZATION_RULES = [
 
     # Banking / transfers
     ("VENMO            PAYMENT", "Venmo Payment"),
-    ("Zelle payment", "Zelle Payment"),
     ("APPLECARD GSBANK PAYMENT", "Apple Card Payment"),
     ("Payment to Chase card ending in 6190", "Chase Card Payment (6190)"),
     ("Payment to Chase card ending in 7529", "Chase Card Payment (7529)"),
@@ -240,7 +239,6 @@ SEED_NORMALIZATION_RULES = [
     ("FID BKG SVC LLC  ACH", "Fidelity Transfer"),
     ("NOE VALLEY ASSOC PAYROLL", "Noe Valley Association Payroll"),
     ("SSA  TREAS 310   XXSOC SEC", "Social Security"),
-    ("Online Payment", "Online Bill Payment"),
     ("MICROSOFT#G", "Microsoft"),
     ("WITHDRAWAL", "Cash Withdrawal"),
 ]
@@ -254,6 +252,45 @@ def seed_normalization_rules(conn: sqlite3.Connection) -> int:
     for pattern, name in SEED_NORMALIZATION_RULES:
         queries.insert_payee_normalization(conn, pattern, name)
     return len(SEED_NORMALIZATION_RULES)
+
+
+# Zelle patterns: "Zelle payment to NAME REF" or "Zelle payment from NAME REF"
+_ZELLE_RE = re.compile(
+    r"Zelle payment (?:to|from)\s+(.+?)\s+(?:JPM|CHA|WF|BOA|USB)\w+\s*$",
+    re.IGNORECASE,
+)
+_ZELLE_RE_SIMPLE = re.compile(
+    r"Zelle payment (?:to|from)\s+(.+?)$",
+    re.IGNORECASE,
+)
+
+
+def _extract_zelle_payee(description: str) -> str | None:
+    """Extract the payee name from a Zelle transaction description."""
+    m = _ZELLE_RE.search(description)
+    if m:
+        return m.group(1).strip().title()
+    m = _ZELLE_RE_SIMPLE.search(description)
+    if m:
+        # Strip trailing reference code (alphanumeric chunk at end)
+        name = re.sub(r"\s+\S*\d\S*$", "", m.group(1).strip())
+        return name.title() if name else m.group(1).strip().title()
+    return None
+
+
+# Online Bill Payment: "Online Payment <ref> To <PAYEE> <date>"
+_ONLINE_PMT_RE = re.compile(
+    r"Online Payment\s+\d+\s+To\s+(.+?)\s+\d{2}/\d{2}\s*$",
+    re.IGNORECASE,
+)
+
+
+def _extract_online_payment_payee(description: str) -> str | None:
+    """Extract the payee name from an Online Payment description."""
+    m = _ONLINE_PMT_RE.search(description)
+    if m:
+        return m.group(1).strip().title()
+    return None
 
 
 def detect_via(description: str) -> str | None:
@@ -294,6 +331,20 @@ def normalize_transactions(conn: sqlite3.Connection, transaction_ids: list[int] 
     for row in rows:
         raw = row["description_raw"]
         via = detect_via(raw)
+
+        # Special case: Zelle — extract payee name from description
+        zelle_payee = _extract_zelle_payee(raw)
+        if zelle_payee:
+            queries.update_transaction(conn, row["id"], payee=zelle_payee, via="Zelle")
+            matched += 1
+            continue
+
+        # Special case: Online Bill Payment — extract payee from "To <NAME>"
+        online_payee = _extract_online_payment_payee(raw)
+        if online_payee:
+            queries.update_transaction(conn, row["id"], payee=online_payee, via="Chase BillPay")
+            matched += 1
+            continue
 
         match = queries.find_payee_match(conn, raw)
         if match:

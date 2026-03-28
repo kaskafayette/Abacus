@@ -26,15 +26,21 @@ def main():
 
     page = st.sidebar.radio(
         "Navigate",
-        ["Home", "Process Latest", "Reports", "Maintenance"],
+        ["Home", "Browse / Search", "Ingest", "Normalize & Categorize", "Reports", "Maintenance"],
         label_visibility="collapsed",
     )
 
     if page == "Home":
         _home_page(conn, pending_count)
-    elif page == "Process Latest":
+    elif page == "Browse / Search":
+        from ui.browse import browse_page
+        browse_page(conn)
+    elif page == "Ingest":
         from ui.process import process_page
         process_page(conn)
+    elif page == "Normalize & Categorize":
+        from ui.normalize import normalize_page
+        normalize_page(conn)
     elif page == "Reports":
         from ui.reports import reports_page
         reports_page(conn)
@@ -56,11 +62,9 @@ def _home_page(conn, pending_count):
 
     if pending_count > 0:
         st.warning(
-            f"You have **{pending_count}** transactions from a previous session awaiting review."
+            f"You have **{pending_count}** transactions awaiting review. "
+            "Go to **Normalize & Categorize** in the sidebar to continue."
         )
-        if st.button("Resume Review"):
-            st.session_state["resume_pending"] = True
-            st.rerun()
 
     # Database stats
     st.subheader("Database Status")

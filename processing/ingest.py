@@ -248,6 +248,9 @@ def parse_file_with_template(filepath: Path, template: sqlite3.Row,
             if not source_label:
                 source_label = prefix
 
+        # Extract order/reference code from description
+        order_ref = _extract_order_ref(desc_raw)
+
         transactions.append({
             "date": dt.isoformat(),
             "amount": str(amount),
@@ -261,6 +264,7 @@ def parse_file_with_template(filepath: Path, template: sqlite3.Row,
             "subcategory": None,
             "tax_flags": None,
             "note": None,
+            "order_ref": order_ref,
             "source": source_label,
             "status": "pending",
             "overridden": 0,
@@ -269,10 +273,38 @@ def parse_file_with_template(filepath: Path, template: sqlite3.Row,
     return transactions
 
 
+# Patterns that contain an order/reference code after * or #
+_ORDER_REF_PATTERNS = [
+    re.compile(r"Amazon\.com\*(\w+)", re.IGNORECASE),
+    re.compile(r"AMAZON MKTPL\*(\w+)", re.IGNORECASE),
+    re.compile(r"AMAZON MKTPLACE\s+\w+\s+(\w+)", re.IGNORECASE),
+    re.compile(r"AMAZON PRIME\*(\w+)", re.IGNORECASE),
+    re.compile(r"Prime Video \*(\w+)", re.IGNORECASE),
+    re.compile(r"Audible\*(\w+)", re.IGNORECASE),
+    re.compile(r"Etsy\.com\*(\w+)", re.IGNORECASE),
+    re.compile(r"GOOGLE \*(\w+)", re.IGNORECASE),
+    re.compile(r"Lumosity\.com\*(\w+)", re.IGNORECASE),
+    re.compile(r"Scribd \*(\w+)", re.IGNORECASE),
+    re.compile(r"ONEQUINCE\*\s*(\w+)", re.IGNORECASE),
+    re.compile(r"GiftHealth\*(\w+)", re.IGNORECASE),
+    re.compile(r"FANDANGO\s+\*(\w+)", re.IGNORECASE),
+]
+
+
+def _extract_order_ref(description: str) -> str | None:
+    """Extract an order/reference code from a raw description, if present."""
+    for pattern in _ORDER_REF_PATTERNS:
+        m = pattern.search(description)
+        if m:
+            return m.group(1)
+    return None
+
+
 def _parse_amount(row: dict, template: sqlite3.Row) -> Decimal | None:
     """Parse the amount from a row, applying sign convention.
 
-    Returns a Decimal where positive = debit (money out), negative = credit (money in).
+    Returns a Decimal where negative = money out, positive = money in
+    (bank statement convention).
     """
     try:
         if template["amount_mode"] == "single":
@@ -281,17 +313,18 @@ def _parse_amount(row: dict, template: sqlite3.Row) -> Decimal | None:
                 return None
             val = Decimal(raw)
             if template["sign_convention"] == "negative_is_debit":
-                # Source: negative = money out → we want positive = money out
-                return -val
-            else:  # positive_is_debit
+                # Source already uses negative = money out — keep as-is
                 return val
+            else:  # positive_is_debit
+                # Source uses positive = money out — flip sign
+                return -val
         else:  # split
             debit_raw = row.get(template["debit_column"], "").strip().replace(",", "")
             credit_raw = row.get(template["credit_column"], "").strip().replace(",", "")
             if debit_raw:
-                return abs(Decimal(debit_raw))
+                return -abs(Decimal(debit_raw))
             elif credit_raw:
-                return -abs(Decimal(credit_raw))
+                return abs(Decimal(credit_raw))
             else:
                 return None
     except (InvalidOperation, KeyError):

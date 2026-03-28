@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     subcategory     TEXT,
     tax_flags       TEXT,
     note            TEXT,
+    order_ref       TEXT,
     source          TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'confirmed', 'needs_review')),
@@ -54,7 +55,9 @@ CREATE TABLE IF NOT EXISTS categories (
 CREATE TABLE IF NOT EXISTS source_file_map (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     source_prefix TEXT NOT NULL UNIQUE,
-    source_label  TEXT NOT NULL
+    source_label  TEXT NOT NULL,
+    nickname      TEXT,
+    account_type  TEXT CHECK (account_type IN ('checking', 'credit_card'))
 );
 
 CREATE TABLE IF NOT EXISTS column_templates (
