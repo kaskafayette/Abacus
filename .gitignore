@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+abacus.db
+abacus.db-wal
+abacus.db-shm
+output/
+processed/
+input/
+.streamlit/
+*.egg-info/
+dist/
+build/
+.env

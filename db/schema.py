@@ -1,0 +1,197 @@
+"""Database schema definitions and initialization for Abacus."""
+
+import sqlite3
+from pathlib import Path
+
+DB_PATH = Path(__file__).resolve().parent.parent / "abacus.db"
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS transactions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    date            DATE NOT NULL,
+    amount          DECIMAL NOT NULL,
+    check_number    TEXT,
+    description_raw TEXT NOT NULL,
+    category_raw    TEXT,
+    payee           TEXT,
+    via             TEXT,
+    payor           TEXT,
+    category        TEXT,
+    subcategory     TEXT,
+    tax_flags       TEXT,
+    note            TEXT,
+    source          TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'confirmed', 'needs_review')),
+    overridden      BOOLEAN NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS payee_normalization (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    search_pattern  TEXT NOT NULL,
+    normalized_name TEXT NOT NULL,
+    payee_suffix    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS payee_metadata (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    normalized_name      TEXT NOT NULL UNIQUE,
+    category_override    TEXT,
+    subcategory_override TEXT,
+    tax_flags_override   TEXT,
+    payor                TEXT,
+    note                 TEXT
+);
+
+CREATE TABLE IF NOT EXISTS categories (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    category         TEXT NOT NULL,
+    subcategory      TEXT,
+    tax_flag_default TEXT,
+    UNIQUE (category, subcategory)
+);
+
+CREATE TABLE IF NOT EXISTS source_file_map (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_prefix TEXT NOT NULL UNIQUE,
+    source_label  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS column_templates (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_prefix      TEXT NOT NULL UNIQUE,
+    date_column        TEXT NOT NULL,
+    check_number_column TEXT,
+    date_format        TEXT NOT NULL,
+    amount_mode        TEXT NOT NULL CHECK (amount_mode IN ('single', 'split')),
+    amount_column      TEXT,
+    debit_column       TEXT,
+    credit_column      TEXT,
+    description_column TEXT NOT NULL,
+    category_raw_column TEXT,
+    sign_convention    TEXT CHECK (sign_convention IN ('negative_is_debit', 'positive_is_debit')),
+    card_column        TEXT
+);
+
+CREATE TABLE IF NOT EXISTS processed_files (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename         TEXT NOT NULL,
+    source_prefix    TEXT NOT NULL,
+    file_hash        TEXT NOT NULL,
+    date_range_start DATE NOT NULL,
+    date_range_end   DATE NOT NULL,
+    ingested_at      DATETIME NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS db_audit_log (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    action    TEXT NOT NULL,
+    detail    TEXT,
+    timestamp DATETIME NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+# Seed data: the full category taxonomy from the spec.
+# Each tuple is (category, subcategory, tax_flag_default).
+SEED_CATEGORIES = [
+    # Income
+    ("Income", "Social Security (net)", None),
+    ("Income", "W2 and 1099 (net)", None),
+    # Transfer
+    ("Transfer", None, None),
+    # Household
+    ("Household", "Groceries", None),
+    ("Household", "Utilities", None),
+    ("Household", "Auto", None),
+    ("Household", "Mortgage", None),
+    ("Household", "Maintenance", None),
+    ("Household", "Subscriptions", None),
+    ("Household", "Capital Improvements", "Capital Improvements"),
+    ("Household", "Office", None),
+    # Fun
+    ("Fun", "Restaurants", None),
+    ("Fun", "Tickets and Other", None),
+    ("Fun", "Travel", None),
+    # Health and Wellness
+    ("Health and Wellness", None, None),
+    # Medical
+    ("Medical", "Prescription Medicines", "Medical"),
+    ("Medical", "Medical Insurance", "Medical"),
+    ("Medical", "Annual Plan Charges", "Medical"),
+    ("Medical", "Medical Devices and Supplies", "Medical"),
+    ("Medical", "Long Term Care", "Medical"),
+    ("Medical", "Travel and Lodging", "Medical"),
+    ("Medical", "Hospitals", "Medical"),
+    ("Medical", "Lab Fees", "Medical"),
+    ("Medical", "Doctors and Dentists", "Medical"),
+    ("Medical", "Therapists", "Medical"),
+    ("Medical", "Misc Medical", "Medical"),
+    # Business Expenses NEC — Business Expense Categories
+    ("Business Expenses NEC", "Travel", "Business Expense"),
+    ("Business Expenses NEC", "Meals", "Business Expense"),
+    ("Business Expenses NEC", "Subcontractors", "Business Expense"),
+    ("Business Expenses NEC", "Office Equipment", "Business Expense"),
+    ("Business Expenses NEC", "Subscriptions and Services", "Business Expense"),
+    ("Business Expenses NEC", "Miscellaneous", "Business Expense"),
+    # Business Expenses (BsnsExp)
+    ("Business Expenses NEC", "Bsns Exp Reimbursable", "Business Expense,Reimbursable"),
+    ("Business Expenses NEC", "Bsns Exp Non-reimbursable", "Business Expense"),
+    ("Business Expenses NEC", "Bsns Exp Reimbursement", "Business Expense,Reimbursable"),
+    # Business Use of Home (BUH)
+    ("Business Expenses NEC", "BUH Deductible Interest", "Business Expense,Home Office"),
+    ("Business Expenses NEC", "BUH Real Estate Tax", "Business Expense,Home Office"),
+    ("Business Expenses NEC", "BUH Insurance", "Business Expense,Home Office"),
+    ("Business Expenses NEC", "BUH Repairs and Maintenance", "Business Expense,Home Office"),
+    ("Business Expenses NEC", "BUH Utilities", "Business Expense,Home Office"),
+    # Shopping
+    ("Shopping", None, None),
+    # Payments
+    ("Payments", "Venmo and Zelle", None),
+    # Cash
+    ("Cash", "Deposited or Withdrawn", None),
+    # Donations
+    ("Donations", "Deductible – Cash", "Donations – Deductible"),
+    ("Donations", "Deductible – Merchandise", "Donations – Deductible"),
+    ("Donations", "Non-Deductible", None),
+    # Tax and Investment Expenses
+    ("Tax and Investment Expenses", "Taxes Paid or Refunded", "Tax-reportable"),
+    ("Tax and Investment Expenses", "Tax Preparation", "Tax-reportable"),
+    ("Tax and Investment Expenses", "Safe Deposit", None),
+    ("Tax and Investment Expenses", "Financial Subscriptions", None),
+    # Taxes Paid (sub-items under Tax and Investment Expenses)
+    ("Tax and Investment Expenses", "Personal Property", "Tax-reportable"),
+    ("Tax and Investment Expenses", "Vehicle Taxes", "Tax-reportable"),
+]
+
+
+def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
+    """Open a connection to the database with standard settings."""
+    path = db_path or DB_PATH
+    conn = sqlite3.connect(str(path), check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db(db_path: Path | None = None) -> tuple[sqlite3.Connection, bool]:
+    """Create the database if needed, apply schema, and seed categories.
+
+    Returns (connection, is_new) where is_new is True if the database
+    was just created for the first time.
+    """
+    path = db_path or DB_PATH
+    is_new = not path.exists()
+    conn = get_connection(path)
+
+    conn.executescript(SCHEMA_SQL)
+
+    if is_new:
+        conn.executemany(
+            "INSERT OR IGNORE INTO categories (category, subcategory, tax_flag_default) "
+            "VALUES (?, ?, ?)",
+            SEED_CATEGORIES,
+        )
+        conn.commit()
+
+    return conn, is_new
