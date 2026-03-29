@@ -424,3 +424,4 @@ Abacus/
 2. **Supplemental source ingestion:** Import Venmo transaction detail and Zelle detail to resolve ambiguous descriptions.
 3. **Transaction splitting:** Allow a single transaction to be split into multiple sub-rows with different categories.
 4. **Payor reporting:** Report showing spending by category broken out by payor.
+5. **Inline grid editing with AG Grid:** Replace `st.data_editor` / `st.dataframe` with `streamlit-aggrid` (pip package) to get proper spreadsheet-style inline editing. AG Grid supports editable cells with per-column dropdown selectors, dynamic dropdowns (e.g. subcategory filtered by selected category), multi-select for tax flags, and inline save on cell change. This is a drop-in replacement within Streamlit - no framework change needed. Applies to Browse/Search and Categorize screens. If a full framework change is ever warranted, NiceGUI is the closest alternative to Streamlit with native AG Grid support.
