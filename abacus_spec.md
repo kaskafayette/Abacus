@@ -156,7 +156,7 @@ Records administrative actions (e.g. purge).
 |---|---|
 | Income | Social Security (net), W2 and 1099 (net) |
 | Transfer | *(no subcategories)* |
-| Household | Groceries, Utilities, Auto, Mortgage, Maintenance, Subscriptions, Capital Improvements, Office, Gifts |
+| Household | Groceries, Utilities, Auto, Mortgage, Maint & Supplies, Subscriptions, Capital Improvements, Office, Gifts, Insurance, Furnishings |
 | Fun | Restaurants, Tickets and Other, Travel |
 | Health and Wellness | *(no subcategories)* |
 | Medical | Prescription Medicines, Medical Insurance, Annual Plan Charges, Medical Devices and Supplies, Long Term Care, Travel and Lodging, Hospitals, Lab Fees, Doctors and Dentists, Therapists, Misc Medical |
@@ -251,25 +251,28 @@ A resumable workflow accessible from the sidebar at any time. Split into two tab
 1. On first run, ~180 starter normalization rules are seeded into `payee_normalization`.
 2. Auto-matching runs against all pending transactions with no payee.
 3. **Special-case extraction:** Zelle descriptions extract the recipient name (e.g. "Zelle payment to DAVID CLIFFORD JPM..." -> payee "David Clifford", via "Zelle"). Online Bill Payment descriptions extract the payee from "To <NAME>" (e.g. "Online Payment ... To STATE FARM INSURANCE" -> payee "State Farm Insurance", via "Chase BillPay").
-4. **Unmatched descriptions** are shown in a scrollable table, de-duplicated with a count column, VIA prefixes stripped, sorted alphabetically.
-5. **Inline assignment** - each unmatched row has a text input and "Assign" button for one-off payee names (e.g. checks).
-6. **Add Normalization Rule** - a form below for creating reusable pattern-based rules. Matched items disappear from the list above.
-7. **Re-run All Normalization** - clears payee/via on all pending/needs_review transactions and re-applies all rules. Available even when all payees are matched.
+4. **Auto-suggest:** Each unmatched description gets an automatically cleaned suggested name. The auto-suggest strips VIA prefixes (SQ *, TST*, AT *, etc.), trailing reference numbers, store numbers, dates, IDs, fixes HTML entities (`&amp;` -> `&`), and applies title case for all-caps names.
+5. **Unmatched descriptions** are shown in a scrollable list, de-duplicated, sorted alphabetically by suggested name, with columns: Description, Count, Total ($), suggested Payee Name.
+6. **Inline workflow per row:**
+   - **Accept** - uses the suggested name as-is (or the edited version). Good for items that are already clean like "Atlas Cafe".
+   - **Copy** - copies the raw description into the edit field for manual cleanup.
+   - **Undo** - reverts an accepted item.
+   - Accepted items show as struck-through with the accepted name in bold.
+7. **Commit All** at the bottom saves all accepted items at once - creates normalization rules and updates transactions. No need to scroll up and down.
+8. **Re-run All Normalization** - clears payee/via on all pending/needs_review transactions and re-applies all rules. Available even when all payees are matched.
 
 ### Category Assignment Tab
 
+Uses AG Grid (streamlit-aggrid) for inline editing.
+
 1. Auto-categorization applies saved `payee_metadata` defaults.
-2. **Summary table** at top shows all pending payees (de-duplicated) with transaction count, total, and current category. Click a row to select it.
-3. **Detail panel** below shows the selected payee's transactions and a category assignment form:
-   - Category dropdown
-   - Subcategory dropdown (dynamically filtered by selected category)
-   - Tax Flags multi-select (auto-populated from category defaults)
-   - Payor dropdown (David / Debra / Both / Unknown)
-   - Note text input
-   - All widget keys are tied to the selected payee so fields reset when switching payees
-4. **Apply to All** - sets category on all transactions for that payee, saves as payee_metadata default for future months.
-5. **Skip (Needs Review)** - marks transactions as needs_review.
-6. **Print Pending Items** - generates a PDF list of all pending transactions.
+2. **View toggle:** "By Payee" (de-duplicated, one row per payee with count, total, and latest date) or "By Transaction" (every individual transaction).
+3. **AG Grid** with inline editable columns:
+   - Payee, # Txns, Total, Last Date (read-only)
+   - Category (dropdown), Subcategory (dropdown, dynamically filtered by category), Tax Flags, Payor (dropdown), Note - all single-click editable
+4. **Save Categorized** - commits every row that has a category set, auto-fills tax flags from category defaults if not manually set, saves payee_metadata defaults for future months. Rows without a category are left as pending.
+5. **Set Rest to Needs Review** - marks all uncategorized rows as needs_review.
+6. **Print Pending Items** - generates a PDF list of all pending transactions, sorted by payee.
 
 ---
 
@@ -336,35 +339,35 @@ All reports saved to `output/`.
 
 ## Maintenance
 
-Six tabs: Source Accounts, Payee Normalization, Payee Metadata, Category Master, Edit Transactions, Database.
-
-All forms include Save and Cancel buttons.
+Seven tabs. All editable tables use AG Grid with single-click inline editing and dropdown selectors.
 
 ### Source Accounts
-- Table showing all accounts: prefix, label, nickname, account type
-- Edit form to update nickname and account type (prefix/label not editable)
+- AG Grid: prefix, label (read-only), nickname and account_type (editable, dropdown for type)
+- Save Changes button
 
 ### Payee Normalization
-- Table of all rules: search pattern, normalized name, payee suffix
+- AG Grid: search_pattern, normalized_name, payee_suffix - all editable inline
 - Add New Rule form
-- Edit / Delete form
 - **Apply Rules to All Transactions** button - re-runs all normalization rules against every transaction (including confirmed), to fix inconsistencies after editing rules
 
 ### Payee Metadata
-- Table of all payee defaults
-- Add / Update form with category/subcategory dropdowns, tax flags, payor, note
-- Delete option
+- AG Grid: normalized_name (read-only), category_override (dropdown), subcategory_override, tax_flags_override, payor (dropdown), note - all editable inline
+- Add New form
 
 ### Category Master
-- Table of all categories with subcategories and tax flag defaults
+- AG Grid: category, subcategory, tax_flag_default - all editable inline
 - Add New Category form
 - Warning that renaming does not cascade to existing transactions
-- Delete option
+
+### Rename / Merge Payees
+- Shows all payees with transaction counts
+- **Rename** mode: select a payee, type new name. Updates transactions, normalization rules, and payee_metadata in one click. Use for cleanup like "The Whitney" -> "Whitney".
+- **Merge** mode: select two payees, pick which name to keep. All transactions from the second are reassigned. The kept name's metadata is preserved. Use for deduplication like "State Farm" + "State Farm Insurance" -> "State Farm Insurance".
 
 ### Edit Transactions
 - Search, date range, source, and status filters
-- Paginated results table
-- Edit panel for individual transactions (payee, category, subcategory, tax flags, payor, note, status)
+- AG Grid with pagination: payee, category (dropdown), subcategory, tax flags, payor (dropdown), note, status (dropdown) - all editable inline
+- Save Changes button updates all edited rows
 
 ### Database
 - File path, size, record counts per table
@@ -424,4 +427,4 @@ Abacus/
 2. **Supplemental source ingestion:** Import Venmo transaction detail and Zelle detail to resolve ambiguous descriptions.
 3. **Transaction splitting:** Allow a single transaction to be split into multiple sub-rows with different categories.
 4. **Payor reporting:** Report showing spending by category broken out by payor.
-5. **Inline grid editing with AG Grid:** Replace `st.data_editor` / `st.dataframe` with `streamlit-aggrid` (pip package) to get proper spreadsheet-style inline editing. AG Grid supports editable cells with per-column dropdown selectors, dynamic dropdowns (e.g. subcategory filtered by selected category), multi-select for tax flags, and inline save on cell change. This is a drop-in replacement within Streamlit - no framework change needed. Applies to Browse/Search and Categorize screens. If a full framework change is ever warranted, NiceGUI is the closest alternative to Streamlit with native AG Grid support.
+5. **AG Grid for Browse/Search:** The Category Assignment and Maintenance screens already use streamlit-aggrid. The Browse/Search screen still uses st.dataframe - could be upgraded to AG Grid for inline editing of all fields. If a full framework change is ever warranted, NiceGUI is the closest alternative to Streamlit with native AG Grid support.
