@@ -520,24 +520,27 @@ def generate_monthly_pdf(conn: sqlite3.Connection, start: str, end: str,
 
 
 def generate_pending_items_pdf(conn: sqlite3.Connection) -> Path | None:
-    """Generate a simple list of all pending transactions."""
+    """Generate a list of all pending transactions, sorted by payee."""
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     pending = queries.get_pending_transactions(conn)
     if not pending:
         return None
 
-    pdf = AbacusPDF(title=f"Pending Items - {len(pending)} transaction(s)")
+    # Sort by payee, then date
+    sorted_pending = sorted(pending, key=lambda t: (t["payee"] or "", t["date"]))
+
+    pdf = AbacusPDF(title=f"Pending Items - {len(sorted_pending)} transaction(s)")
     pdf.alias_nb_pages()
     pdf.add_page()
 
-    widths = [25, 40, 28, 120, 50]
-    pdf.table_header(widths, ["Date", "Source", "Amount", "Description", "Note"])
+    widths = [40, 20, 28, 30, 100, 40]
+    pdf.table_header(widths, ["Payee", "Date", "Amount", "Source", "Description", "Note"])
 
-    for t in pending:
+    for t in sorted_pending:
         pdf.table_row(widths, [
-            t["date"], t["source"], _fmt_amt(t["amount"]),
-            t["description_raw"], t["note"] or "",
+            t["payee"] or "", t["date"], _fmt_amt(t["amount"]),
+            t["source"], t["description_raw"], t["note"] or "",
         ])
 
     out_path = OUTPUT_DIR / "Pending_Items.pdf"

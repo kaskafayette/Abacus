@@ -308,6 +308,45 @@ def strip_via_prefix(description: str) -> str:
     return description.strip()
 
 
+def auto_suggest_payee(description: str) -> str:
+    """Generate a clean suggested payee name from a raw description.
+
+    Strips VIA prefixes, trailing reference numbers, dates, IDs,
+    HTML entities, store numbers, and applies title case.
+    """
+    name = description
+
+    # Strip known VIA prefixes
+    for pattern, _ in VIA_PATTERNS:
+        name = pattern.sub("", name)
+
+    # Fix HTML entities from Chase CSVs
+    name = name.replace("&amp;", "&")
+
+    # Strip trailing reference numbers, dates, IDs, store numbers
+    name = re.sub(r"\s+\d{5,}.*$", "", name)          # long trailing numbers (5+ digits)
+    name = re.sub(r"\s+\d{2}/\d{2}$", "", name)       # trailing MM/DD
+    name = re.sub(r"\s+\d{2}/\d{2}/\d{2,4}$", "", name)  # trailing date
+    name = re.sub(r"\s+PPD ID:.*$", "", name)          # ACH PPD IDs
+    name = re.sub(r"\s+WEB ID:.*$", "", name)          # WEB IDs
+    name = re.sub(r"\s*#\S+$", "", name)               # trailing #ref
+    name = re.sub(r"\s*\*\S+$", "", name)              # trailing *ref
+    name = re.sub(r"\s+\d{3,}$", "", name)             # trailing 3+ digit store number
+
+    # Strip common prefixes that indicate intermediaries not in VIA_PATTERNS
+    name = re.sub(r"^AT\s*\*\s*", "", name, flags=re.IGNORECASE)  # AT * (e.g. AT * Whitney Museum)
+
+    # Clean up extra whitespace and punctuation
+    name = name.strip(" ,-.*")
+    name = re.sub(r"\s{2,}", " ", name)
+
+    # Title case if it's all caps or all lower
+    if name == name.upper() or name == name.lower():
+        name = name.title()
+
+    return name if name else description
+
+
 def normalize_transactions(conn: sqlite3.Connection, transaction_ids: list[int] | None = None):
     """Run payee normalization on pending transactions.
 
@@ -358,6 +397,7 @@ def normalize_transactions(conn: sqlite3.Connection, transaction_ids: list[int] 
                 "id": row["id"],
                 "description_raw": raw,
                 "cleaned_desc": strip_via_prefix(raw),
+                "suggested_name": auto_suggest_payee(raw),
                 "via": via,
                 "date": row["date"],
                 "amount": row["amount"],

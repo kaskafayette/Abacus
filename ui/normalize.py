@@ -76,96 +76,139 @@ def _normalization(conn):
             st.rerun()
         return
 
-    st.warning(f"**{len(unmatched)}** unrecognized description(s) remaining")
-
-    # --- Top: unmatched descriptions, de-duped, sorted, with one-off payee assignment ---
-    st.markdown("#### Unmatched Descriptions")
-    st.caption(
-        "De-duplicated and sorted. For recurring payees, use **Add Rule** below. "
-        "For one-offs (checks, withdrawals), type a payee name directly and click **Assign**."
-    )
-
-    desc_counts = Counter(item["cleaned_desc"] for item in unmatched)
-    seen = set()
-    display_items = []
+    # De-duplicate by cleaned description, gather stats
+    desc_groups = {}
     for item in unmatched:
         desc = item["cleaned_desc"]
-        if desc in seen:
-            continue
-        seen.add(desc)
-        display_items.append({
-            "cleaned_desc": desc,
-            "via": item["via"] or "",
-            "count": desc_counts[desc],
-            "source": item["source"],
-            "ids": [i["id"] for i in unmatched if i["cleaned_desc"] == desc],
-            "raw": item["description_raw"],
-        })
+        if desc not in desc_groups:
+            desc_groups[desc] = {
+                "cleaned_desc": desc,
+                "suggested_name": item["suggested_name"],
+                "via": item["via"] or "",
+                "count": 0,
+                "total": 0.0,
+                "ids": [],
+                "raw": item["description_raw"],
+            }
+        desc_groups[desc]["count"] += 1
+        desc_groups[desc]["total"] += float(item["amount"])
+        desc_groups[desc]["ids"].append(item["id"])
 
-    # Scrollable container with inline assign
+    display_items = sorted(desc_groups.values(), key=lambda x: x["suggested_name"].lower())
+
+    st.warning(f"**{len(display_items)}** unique description(s), **{len(unmatched)}** transaction(s) remaining")
+
+    st.caption(
+        "Review each item. The **Suggested Name** is auto-generated. "
+        "Click **Accept** to use it as-is, or edit it first. "
+        "Click **Copy** to copy the raw description into the edit field. "
+        "When done, click **Commit All** at the bottom to save all accepted items as normalization rules."
+    )
+
+    # Header row
+    col_h1, col_h2, col_h3, col_h4, col_h5, col_h6, col_h7 = st.columns([3, 0.7, 0.8, 0.6, 2.5, 0.7, 0.7])
+    col_h1.markdown("**Description**")
+    col_h2.markdown("**Count**")
+    col_h3.markdown("**Total**")
+    col_h4.markdown("")
+    col_h5.markdown("**Payee Name**")
+    col_h6.markdown("")
+    col_h7.markdown("")
+
+    # Track which items have been accepted (in session state)
+    if "norm_accepted" not in st.session_state:
+        st.session_state.norm_accepted = {}
+
     for idx, item in enumerate(display_items):
-        col_desc, col_via, col_count, col_payee, col_btn = st.columns([4, 1, 0.5, 2, 1])
-        col_desc.text(item["cleaned_desc"])
-        col_via.text(item["via"])
-        col_count.text(str(item["count"]))
-        payee_val = col_payee.text_input(
-            "Payee", key=f"oneoff_{idx}", label_visibility="collapsed",
-            placeholder="Type payee name...",
-        )
-        if col_btn.button("Assign", key=f"assign_{idx}"):
-            if payee_val and payee_val.strip():
-                name = payee_val.strip()
-                via = item["via"] or None
-                for tid in item["ids"]:
-                    updates = {"payee": name}
-                    if via:
-                        updates["via"] = via
-                    queries.update_transaction(conn, tid, **updates)
-                st.session_state.pop("norm_run", None)
+        raw_key = item["raw"]
+        already_accepted = raw_key in st.session_state.norm_accepted
+
+        col_desc, col_count, col_total, col_copy, col_name, col_accept, col_undo = st.columns([3, 0.7, 0.8, 0.6, 2.5, 0.7, 0.7])
+
+        if already_accepted:
+            accepted_name = st.session_state.norm_accepted[raw_key]
+            col_desc.markdown(f"~~{item['cleaned_desc']}~~")
+            col_count.text(str(item["count"]))
+            col_total.text(f"${abs(item['total']):,.0f}")
+            col_name.markdown(f"**{accepted_name}**")
+            if col_undo.button("Undo", key=f"undo_{idx}"):
+                del st.session_state.norm_accepted[raw_key]
+                st.rerun()
+        else:
+            col_desc.text(item["cleaned_desc"])
+            col_count.text(str(item["count"]))
+            col_total.text(f"${abs(item['total']):,.0f}")
+
+            # Copy button puts cleaned description into the text field
+            copy_key = f"copy_flag_{idx}"
+            if col_copy.button("Copy", key=f"copy_{idx}"):
+                st.session_state[f"payee_field_{idx}"] = item["cleaned_desc"]
+                st.rerun()
+
+            # Editable payee name field - pre-filled with auto-suggestion
+            default_val = st.session_state.get(f"payee_field_{idx}", item["suggested_name"])
+            payee_val = col_name.text_input(
+                "name", key=f"payee_field_{idx}", value=default_val,
+                label_visibility="collapsed",
+            )
+
+            if col_accept.button("Accept", key=f"accept_{idx}"):
+                name = payee_val.strip() if payee_val else item["suggested_name"]
+                st.session_state.norm_accepted[raw_key] = name
                 st.rerun()
 
     st.divider()
 
-    # --- Add a reusable normalization rule ---
-    st.markdown("#### Add Normalization Rule")
-    st.caption(
-        "For recurring payees: enter a search pattern (case-insensitive substring match) "
-        "and the normalized name. All matching transactions update and the rule is saved for future months."
-    )
+    # Commit all accepted items
+    accepted_count = len(st.session_state.get("norm_accepted", {}))
+    remaining_count = len(display_items) - accepted_count
 
-    with st.form("norm_rule_form", clear_on_submit=True):
-        col1, col2 = st.columns(2)
-        pattern = col1.text_input("Search Pattern", placeholder="e.g. WHOLEFDS")
-        name = col2.text_input("Normalized Name", placeholder="e.g. Whole Foods")
-        submitted = st.form_submit_button("Apply Rule")
+    col1, col2, col3 = st.columns([1, 1, 2])
+    col3.caption(f"{accepted_count} accepted, {remaining_count} remaining")
 
-    if submitted and pattern and name:
-        count = apply_pattern_rule(conn, pattern.strip(), name.strip())
-        if count > 0:
-            st.success(f"Matched **{count}** transaction(s) → **{name}**")
-        else:
-            st.warning(f"No pending transactions matched pattern '{pattern}'")
+    if col1.button("Commit All", type="primary", disabled=(accepted_count == 0)):
+        accepted = st.session_state.norm_accepted
+        for item in display_items:
+            raw_key = item["raw"]
+            if raw_key not in accepted:
+                continue
+            name = accepted[raw_key]
+            via = item["via"] or None
+
+            # Create a normalization rule for future months
+            # Use the cleaned description as the search pattern
+            pattern = item["cleaned_desc"]
+            queries.insert_payee_normalization(conn, pattern, name)
+
+            # Update all matching transactions
+            for tid in item["ids"]:
+                updates = {"payee": name}
+                if via:
+                    updates["via"] = via
+                queries.update_transaction(conn, tid, **updates)
+
+        st.session_state.pop("norm_accepted", None)
+        st.session_state.pop("norm_run", None)
+        st.success(f"Committed {accepted_count} payee(s).")
+        st.rerun()
+
+    if col2.button("Re-scan"):
+        st.session_state.pop("norm_accepted", None)
         st.session_state.pop("norm_run", None)
         st.rerun()
 
     st.divider()
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Re-scan Unmatched"):
-            st.session_state.pop("norm_run", None)
-            st.rerun()
-    with col2:
-        if st.button("Re-run All Normalization"):
-            # Clear payee/via on all pending transactions and re-apply rules
-            conn.execute(
-                "UPDATE transactions SET payee = NULL, via = NULL "
-                "WHERE status IN ('pending', 'needs_review')"
-            )
-            conn.commit()
-            st.session_state.pop("norm_run", None)
-            st.session_state.pop("norm_seeded", None)
-            st.rerun()
+    if st.button("Re-run All Normalization"):
+        conn.execute(
+            "UPDATE transactions SET payee = NULL, via = NULL "
+            "WHERE status IN ('pending', 'needs_review')"
+        )
+        conn.commit()
+        st.session_state.pop("norm_accepted", None)
+        st.session_state.pop("norm_run", None)
+        st.session_state.pop("norm_seeded", None)
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +228,7 @@ TAX_FLAG_OPTIONS = [
 
 def _categorization(conn):
     st.subheader("Category Assignment")
+    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 
     # Auto-categorize on first visit
     if "cat_auto_done" not in st.session_state:
@@ -198,7 +242,6 @@ def _categorization(conn):
         st.success("No pending transactions. All done!")
         return
 
-    # Check for unnormalized transactions
     unnormalized = [t for t in pending if not t["payee"]]
     if unnormalized:
         st.warning(
@@ -210,20 +253,22 @@ def _categorization(conn):
     category_names = queries.get_category_names(conn)
     all_categories = queries.get_categories(conn)
     subcats_map = {}
+    all_subcats = set()
     tax_defaults_map = {}
     for cat in all_categories:
         c = cat["category"]
         sc = cat["subcategory"]
         if c not in subcats_map:
-            subcats_map[c] = []
+            subcats_map[c] = [""]
         if sc:
             subcats_map[c].append(sc)
+            all_subcats.add(sc)
         if cat["tax_flag_default"]:
             tax_defaults_map[(c, sc)] = cat["tax_flag_default"]
 
     payor_options = ["", "David", "Debra", "Both", "Unknown"]
 
-    # Group pending transactions by payee
+    # Group pending by payee
     payee_groups = {}
     for t in pending:
         payee = t["payee"] or "(no payee)"
@@ -231,142 +276,187 @@ def _categorization(conn):
             payee_groups[payee] = []
         payee_groups[payee].append(t)
 
-    sorted_payees = sorted(payee_groups.keys())
+    # Toggle: by payee (de-duped) or by transaction (full detail)
+    view_mode = st.radio("View", ["By Payee", "By Transaction"], horizontal=True, key="cat_view_mode")
 
-    st.caption(f"{len(sorted_payees)} unique payee(s), {len(pending)} transaction(s) pending")
+    if view_mode == "By Payee":
+        grid_data = []
+        for payee in sorted(payee_groups.keys()):
+            txns = payee_groups[payee]
+            total = sum(float(t["amount"]) for t in txns)
+            latest_date = max(t["date"] for t in txns)
+            grid_data.append({
+                "Payee": payee,
+                "# Txns": len(txns),
+                "Total": round(total, 2),
+                "Last Date": latest_date,
+                "Category": txns[0]["category"] or "",
+                "Subcategory": txns[0]["subcategory"] or "",
+                "Tax Flags": txns[0]["tax_flags"] or "",
+                "Payor": txns[0]["payor"] or "",
+                "Note": txns[0]["note"] or "",
+            })
+    else:
+        grid_data = []
+        for t in sorted(pending, key=lambda x: (x["payee"] or "", x["date"])):
+            grid_data.append({
+                "Payee": t["payee"] or "(no payee)",
+                "# Txns": 1,
+                "Total": round(float(t["amount"]), 2),
+                "Last Date": t["date"],
+                "Category": t["category"] or "",
+                "Subcategory": t["subcategory"] or "",
+                "Tax Flags": t["tax_flags"] or "",
+                "Payor": t["payor"] or "",
+                "Note": t["note"] or "",
+                "_id": t["id"],
+            })
 
-    # --- Top: clickable payee table ---
-    summary_data = []
-    for payee in sorted_payees:
-        txns = payee_groups[payee]
-        total = sum(float(t["amount"]) for t in txns)
-        summary_data.append({
-            "Payee": payee,
-            "# Txns": len(txns),
-            "Total": total,
-            "Category": txns[0]["category"] or "",
-        })
-    summary_df = pd.DataFrame(summary_data)
+    df = pd.DataFrame(grid_data)
 
-    selection = st.dataframe(
-        summary_df,
-        use_container_width=True,
-        hide_index=True,
-        height=350,
-        column_config={
-            "Total": st.column_config.NumberColumn(format="$%.2f"),
-        },
-        on_select="rerun",
-        selection_mode="single-row",
-        key="payee_table",
+    if view_mode == "By Payee":
+        st.caption(
+            f"{len(grid_data)} unique payee(s), {len(pending)} transaction(s) pending. "
+            "Edit Category, Subcategory, Payor, and Note inline. Click **Save All** when done."
+        )
+    else:
+        st.caption(
+            f"{len(grid_data)} transaction(s) pending. "
+            "Edit inline. Click **Save All** when done."
+        )
+
+    # JavaScript to dynamically filter subcategory based on category
+    import json
+    subcats_json = json.dumps(subcats_map)
+
+    subcat_cell_editor_params = JsCode(f"""
+        function(params) {{
+            var subcatsMap = {subcats_json};
+            var cat = params.data.Category;
+            if (cat && subcatsMap[cat]) {{
+                return {{ values: subcatsMap[cat] }};
+            }}
+            return {{ values: [''] }};
+        }}
+    """)
+
+    gb = GridOptionsBuilder.from_dataframe(df)
+    gb.configure_default_column(resizable=True, sortable=True, editable=False)
+    gb.configure_grid_options(singleClickEdit=True, stopEditingWhenCellsLoseFocus=True)
+
+    # Read-only columns
+    gb.configure_column("Payee", width=180)
+    if view_mode == "By Payee":
+        gb.configure_column("# Txns", width=70)
+    else:
+        gb.configure_column("# Txns", hide=True)
+    gb.configure_column("Last Date", width=100)
+    gb.configure_column("Total", width=100,
+                        type=["numericColumn"],
+                        valueFormatter=JsCode("function(params) { return '$' + params.value.toFixed(2); }"))
+    if "_id" in df.columns:
+        gb.configure_column("_id", hide=True)
+
+    # Editable columns with dropdowns
+    gb.configure_column("Category", editable=True, width=160,
+                        cellEditor="agSelectCellEditor",
+                        cellEditorParams={"values": [""] + category_names})
+    gb.configure_column("Subcategory", editable=True, width=160,
+                        cellEditor="agSelectCellEditor",
+                        cellEditorParams=subcat_cell_editor_params)
+    gb.configure_column("Tax Flags", editable=True, width=140)
+    gb.configure_column("Payor", editable=True, width=100,
+                        cellEditor="agSelectCellEditor",
+                        cellEditorParams={"values": payor_options})
+    gb.configure_column("Note", editable=True, width=150)
+
+    grid_options = gb.build()
+
+    grid_response = AgGrid(
+        df,
+        gridOptions=grid_options,
+        update_mode=GridUpdateMode.VALUE_CHANGED,
+        fit_columns_on_grid_load=True,
+        height=450,
+        allow_unsafe_jscode=True,
     )
 
-    # Determine selected payee
-    selected_rows = selection.get("selection", {}).get("rows", [])
-    if not selected_rows:
-        st.info("Click a payee row above to assign its category.")
-        _cat_footer(conn)
-        return
+    edited_df = grid_response["data"]
 
-    selected_idx = selected_rows[0]
-    if selected_idx >= len(sorted_payees):
-        st.info("Click a payee row above to assign its category.")
-        _cat_footer(conn)
-        return
+    # Save / Skip buttons
+    col1, col2, col3 = st.columns(3)
 
-    payee_select = sorted_payees[selected_idx]
-    txns = payee_groups[payee_select]
+    if col1.button("Save Categorized", type="primary"):
+        saved = 0
+        for _, row in edited_df.iterrows():
+            payee = row["Payee"]
+            cat = row["Category"]
+            subcat = row["Subcategory"]
+            tax = row["Tax Flags"]
+            payor = row["Payor"]
+            note = row["Note"]
 
-    # --- Bottom: selected payee detail + category form ---
-    st.divider()
-    st.markdown(f"#### {payee_select}")
-    st.caption(f"{len(txns)} transaction(s)")
+            if not cat:
+                continue
 
-    # Show this payee's transactions
-    txn_display = []
-    for t in txns:
-        txn_display.append({
-            "Date": t["date"],
-            "Source": t["source"],
-            "Amount": float(t["amount"]),
-            "Description": t["description_raw"],
-            "Via": t["via"] or "",
-        })
-    st.dataframe(
-        pd.DataFrame(txn_display),
-        use_container_width=True,
-        hide_index=True,
-        height=min(180, 35 * len(txn_display) + 38),
-        column_config={
-            "Amount": st.column_config.NumberColumn(format="$%.2f"),
-        },
-    )
+            # Look up tax defaults if user didn't set flags manually
+            if not tax and cat:
+                key = (cat, subcat if subcat else None)
+                if key in tax_defaults_map:
+                    tax = tax_defaults_map[key]
+                elif (cat, None) in tax_defaults_map:
+                    tax = tax_defaults_map[(cat, None)]
 
-    # Use payee name in keys so widgets reset when selection changes
-    pk = payee_select.replace(" ", "_")
+            if view_mode == "By Transaction" and "_id" in row:
+                # Update just this one transaction
+                queries.update_transaction(
+                    conn, int(row["_id"]),
+                    category=cat,
+                    subcategory=subcat or None,
+                    tax_flags=tax or None,
+                    payor=payor or None,
+                    note=note or None,
+                    status="confirmed",
+                    overridden=1,
+                )
+            else:
+                # Update all transactions for this payee
+                txns = payee_groups.get(payee, [])
+                for t in txns:
+                    queries.update_transaction(
+                        conn, t["id"],
+                        category=cat,
+                        subcategory=subcat or None,
+                        tax_flags=tax or None,
+                        payor=payor or None,
+                        note=note or None,
+                        status="confirmed",
+                        overridden=1,
+                    )
 
-    # Category / subcategory — outside form so subcategory updates dynamically
-    col1, col2 = st.columns(2)
-    category = col1.selectbox("Category", [""] + category_names, key=f"cat_{pk}")
-    subcats = subcats_map.get(category, []) if category else []
-    subcategory = col2.selectbox("Subcategory", [""] + subcats, key=f"subcat_{pk}")
+            # Save payee default
+            if payee != "(no payee)":
+                save_payee_defaults(conn, [{
+                    "normalized_name": payee,
+                    "category": cat,
+                    "subcategory": subcat or None,
+                    "tax_flags": tax or None,
+                    "payor": payor or None,
+                    "note": note or None,
+                }])
+            saved += 1
 
-    # Auto-populate tax flags from category defaults
-    default_flags = []
-    if category and (category, subcategory or None) in tax_defaults_map:
-        default_flags = [f.strip() for f in tax_defaults_map[(category, subcategory or None)].split(",")]
-    elif category and (category, None) in tax_defaults_map:
-        default_flags = [f.strip() for f in tax_defaults_map[(category, None)].split(",")]
-
-    tax_flags = st.multiselect(
-        "Tax Flags",
-        TAX_FLAG_OPTIONS,
-        default=[f for f in default_flags if f in TAX_FLAG_OPTIONS],
-        key=f"tax_{pk}",
-    )
-
-    col3, col4 = st.columns(2)
-    payor = col3.selectbox("Payor", payor_options, key=f"payor_{pk}")
-    note = col4.text_input("Note", key=f"note_{pk}")
-
-    col_save, col_skip, col_cancel = st.columns(3)
-    save = col_save.button("Apply to All", type="primary")
-    skip = col_skip.button("Skip (Needs Review)")
-    cancel = col_cancel.button("Cancel")
-
-    if save and category:
-        tax_str = ", ".join(tax_flags) if tax_flags else None
-        for t in txns:
-            queries.update_transaction(
-                conn, t["id"],
-                category=category,
-                subcategory=subcategory or None,
-                tax_flags=tax_str,
-                payor=payor or None,
-                note=note or None,
-                status="confirmed",
-                overridden=1,
-            )
-        # Save as payee default for future months
-        if payee_select != "(no payee)":
-            save_payee_defaults(conn, [{
-                "normalized_name": payee_select,
-                "category": category,
-                "subcategory": subcategory or None,
-                "tax_flags": tax_str,
-                "payor": payor or None,
-                "note": note or None,
-            }])
         st.session_state.pop("cat_auto_done", None)
+        st.success(f"Saved {saved} item(s).")
         st.rerun()
-    elif save and not category:
-        st.error("Please select a category.")
-    elif skip:
-        for t in txns:
-            queries.update_transaction(conn, t["id"], status="needs_review")
+
+    if col2.button("Set Rest to Needs Review"):
+        for _, row in edited_df.iterrows():
+            if not row["Category"]:
+                txns = payee_groups.get(row["Payee"], [])
+                for t in txns:
+                    queries.update_transaction(conn, t["id"], status="needs_review")
         st.session_state.pop("cat_auto_done", None)
-        st.rerun()
-    elif cancel:
         st.rerun()
 
     _cat_footer(conn)

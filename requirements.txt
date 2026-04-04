@@ -1,4 +1,5 @@
 streamlit
+streamlit-aggrid
 fpdf2
 openpyxl
 pandas
