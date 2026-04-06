@@ -190,7 +190,15 @@ def _payee_metadata(conn):
                             cellEditor="agSelectCellEditor",
                             cellEditorParams={"values": [""] + category_names})
         gb.configure_column("subcategory_override", editable=True, width=150)
-        gb.configure_column("tax_flags_override", editable=True, width=140)
+        tax_flag_values = [
+            "", "Tax-reportable", "Reimbursable", "Capital Improvements",
+            "Home Office", "Donations - Deductible", "Medical", "Business Expense",
+            "Business Expense, Reimbursable",
+            "Business Expense, Home Office",
+        ]
+        gb.configure_column("tax_flags_override", editable=True, width=160,
+                            cellEditor="agSelectCellEditor",
+                            cellEditorParams={"values": tax_flag_values})
         gb.configure_column("payor", editable=True, width=100,
                             cellEditor="agSelectCellEditor",
                             cellEditorParams={"values": payor_options})
@@ -276,7 +284,15 @@ def _category_master(conn):
         gb.configure_column("id", width=50)
         gb.configure_column("category", editable=True, width=180)
         gb.configure_column("subcategory", editable=True, width=180)
-        gb.configure_column("tax_flag_default", editable=True, width=200)
+        tax_flag_values = [
+            "", "Tax-reportable", "Reimbursable", "Capital Improvements",
+            "Home Office", "Donations - Deductible", "Medical", "Business Expense",
+            "Business Expense, Reimbursable",
+            "Business Expense, Home Office",
+        ]
+        gb.configure_column("tax_flag_default", editable=True, width=200,
+                            cellEditor="agSelectCellEditor",
+                            cellEditorParams={"values": tax_flag_values})
 
         grid_response = AgGrid(
             df[["id", "category", "subcategory", "tax_flag_default"]],
@@ -514,7 +530,15 @@ def _edit_transactions(conn):
     gb.configure_column("Amount", width=90,
                         type=["numericColumn"],
                         valueFormatter=JsCode("function(params) { return '$' + params.value.toFixed(2); }"))
-    gb.configure_column("Tax Flags", editable=True, width=120)
+    tax_flag_values = [
+        "", "Tax-reportable", "Reimbursable", "Capital Improvements",
+        "Home Office", "Donations - Deductible", "Medical", "Business Expense",
+        "Business Expense, Reimbursable",
+        "Business Expense, Home Office",
+    ]
+    gb.configure_column("Tax Flags", editable=True, width=160,
+                        cellEditor="agSelectCellEditor",
+                        cellEditorParams={"values": tax_flag_values})
     gb.configure_column("Payor", editable=True, width=90,
                         cellEditor="agSelectCellEditor",
                         cellEditorParams={"values": payor_options})

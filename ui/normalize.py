@@ -279,34 +279,50 @@ def _categorization(conn):
     # Toggle: by payee (de-duped) or by transaction (full detail)
     view_mode = st.radio("View", ["By Payee", "By Transaction"], horizontal=True, key="cat_view_mode")
 
+    def _resolve_tax_flags(cat, subcat, explicit_flags):
+        """Return explicit flags if set, otherwise look up the default from category."""
+        if explicit_flags:
+            return explicit_flags
+        if cat:
+            key = (cat, subcat if subcat else None)
+            if key in tax_defaults_map:
+                return tax_defaults_map[key]
+            if (cat, None) in tax_defaults_map:
+                return tax_defaults_map[(cat, None)]
+        return ""
+
     if view_mode == "By Payee":
         grid_data = []
         for payee in sorted(payee_groups.keys()):
             txns = payee_groups[payee]
             total = sum(float(t["amount"]) for t in txns)
             latest_date = max(t["date"] for t in txns)
+            cat = txns[0]["category"] or ""
+            subcat = txns[0]["subcategory"] or ""
             grid_data.append({
                 "Payee": payee,
                 "# Txns": len(txns),
                 "Total": round(total, 2),
                 "Last Date": latest_date,
-                "Category": txns[0]["category"] or "",
-                "Subcategory": txns[0]["subcategory"] or "",
-                "Tax Flags": txns[0]["tax_flags"] or "",
+                "Category": cat,
+                "Subcategory": subcat,
+                "Tax Flags": _resolve_tax_flags(cat, subcat, txns[0]["tax_flags"]),
                 "Payor": txns[0]["payor"] or "",
                 "Note": txns[0]["note"] or "",
             })
     else:
         grid_data = []
         for t in sorted(pending, key=lambda x: (x["payee"] or "", x["date"])):
+            cat = t["category"] or ""
+            subcat = t["subcategory"] or ""
             grid_data.append({
                 "Payee": t["payee"] or "(no payee)",
                 "# Txns": 1,
                 "Total": round(float(t["amount"]), 2),
                 "Last Date": t["date"],
-                "Category": t["category"] or "",
-                "Subcategory": t["subcategory"] or "",
-                "Tax Flags": t["tax_flags"] or "",
+                "Category": cat,
+                "Subcategory": subcat,
+                "Tax Flags": _resolve_tax_flags(cat, subcat, t["tax_flags"]),
                 "Payor": t["payor"] or "",
                 "Note": t["note"] or "",
                 "_id": t["id"],
@@ -364,7 +380,15 @@ def _categorization(conn):
     gb.configure_column("Subcategory", editable=True, width=160,
                         cellEditor="agSelectCellEditor",
                         cellEditorParams=subcat_cell_editor_params)
-    gb.configure_column("Tax Flags", editable=True, width=140)
+    tax_flag_values = [
+        "", "Tax-reportable", "Reimbursable", "Capital Improvements",
+        "Home Office", "Donations - Deductible", "Medical", "Business Expense",
+        "Business Expense, Reimbursable",
+        "Business Expense, Home Office",
+    ]
+    gb.configure_column("Tax Flags", editable=True, width=160,
+                        cellEditor="agSelectCellEditor",
+                        cellEditorParams={"values": tax_flag_values})
     gb.configure_column("Payor", editable=True, width=100,
                         cellEditor="agSelectCellEditor",
                         cellEditorParams={"values": payor_options})
