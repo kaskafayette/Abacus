@@ -423,40 +423,106 @@ Abacus/
 
 ## Detail-File Enrichment (Venmo & Amazon)
 
-Some source files don't represent new transactions — they add missing detail to Chase rows that already exist. Venmo and Amazon are both this shape. Abacus handles them through a generalized enrichment pipeline (`processing/enrich.py`), separate from the main ingest pipeline. A new **Enrich** page in the sidebar sits between Ingest and Normalize & Categorize.
+Some source files don't represent new transactions — they add missing detail to Chase rows that already exist. Venmo and Amazon are both this shape. Abacus handles them through a generalized enrichment pipeline (`processing/enrich.py`) that runs as part of the Ingest workflow. **Enrichment never creates new master transactions — it only updates fields on existing Chase rows.** This means totals stay correct even when enrichment is partial, delayed, or never arrives.
+
+### Folder layout
+
+- `input/` — where the user drops files each period
+- `pending/` — enrichment files whose records haven't all matched yet; retried automatically every Ingest run
+- `processed/` — files that have fully completed (transaction files fully ingested, enrichment files with all expected records matched)
+
+### Workflow when the user opens Ingest
+
+1. **Routing.** The page scans `input/` and sorts each file by its `source_file_map.account_type`:
+   - Transaction-type (`checking`, `credit_card`) stays in `input/` for normal ingest.
+   - Enrich-type (`venmo_detail`, `amazon_detail`) is moved to `pending/`.
+   - Unknown prefix triggers an **account continuity prompt**: "Is this a brand-new account, or a replacement for an existing one?" If replacement, the old prefix's row records `replaced_by_prefix` so future matching traverses both.
+2. **Cross-source completeness check.** For every source that was present in prior periods, verify the current input/pending set still includes it. Missing sources prompt with four options:
+   1. Continue anyway
+   2. Stop processing so I can provide the missing data
+   3. The missing account has been discontinued — stop warning
+   4. The missing account has been replaced — capture the new prefix and link them
+3. **Ingest transaction files** (existing flow) with three behavior changes:
+   - Chase rows matching the Venmo placeholder pattern get a default category of **Cash → Deposited or Withdrawn**. Chase rows matching Amazon patterns get **Shopping**. These defaults stick if enrichment never arrives, so reports remain accurate.
+   - Row-level duplicates are **silently skipped** with a counter (previously a hard error that aborted the batch).
+   - Per-source date continuity warns on gaps; **overlaps are silently OK** since row-level dedup catches duplicates.
+4. **Process enrichment files from `pending/`.** For each file: parser → records → match → preview. User reviews and clicks **Confirm**. Matched proposals apply; the file moves to `processed/` only when every record marked `expected_to_match=True` has applied. Unresolved files stay in `pending/` and retry next period — no further action required. The manual confirm step exists for trust-building and will become auto-apply later.
+5. **Categorize & finalize.** Auto-enriched rows land in `pending` status; user explicitly reviews and confirms each before reports run. This is intentional — the same payee can sometimes belong to a different category (a normally-social Venmo payment that's a one-off reimbursable business expense, e.g.), so per-transaction review stays a gate.
+
+### Filename convention
+
+Same regex as Chase. One shared account each — David and Debra share both:
+- `Venmo MM-DD-YYYY to MM-DD-YYYY.csv`
+- `Amazon MM-DD-YYYY to MM-DD-YYYY.csv`
+
+### Placeholder payees and the no-pollute rule
+
+Chase ingest normalizes "VENMO PAYMENT" descriptions to the payee "Venmo Payment", which is a *placeholder*: it represents many different real recipients, not one entity. The same goes for "Amazon" before enrichment fills in line-items. Two rules protect the learning system from being polluted by placeholders:
+
+1. **Payee cell is locked in the Categorize UI for any row whose payee is a placeholder.** The user can't manually fill in a Venmo recipient name — only enrichment can. (The user's reasoning: without the Venmo file, they don't actually know who got paid, so guessing serves no purpose.)
+2. **`payee_metadata` is not written when the user categorizes a placeholder-payee row.** The category lands on the transaction but doesn't generalize. This prevents "Venmo Payment → Cash" from being applied to every future Venmo row across different real recipients.
+
+`PLACEHOLDER_PAYEES` lives in `processing/placeholders.py` as a single set; adding a new enrichment source = adding to that set.
+
+### Idempotency
+
+`apply_matches` skips any Chase row where `overridden = 1`. The first successful enrichment sets that flag, so re-running a pending file next period is safe — already-patched rows are no-ops, and only newly-matchable records get touched. Manual edits in the Maintenance / Categorize UIs also set `overridden = 1`, so they're protected from being overwritten by a delayed enrichment.
+
+### Learning loop — Venmo payees
+
+Once enrichment patches a Chase row's payee to "Sylvia Vientulis," the existing `payee_metadata` mechanism takes over. Categorize Sylvia once and next month's Venmo payment to her auto-categorizes. No special wiring — `apply_matches` triggers the auto-categorize pass on affected rows immediately after patching.
+
+### Learning loop — Amazon items
+
+A single Amazon order can span categories (atorvastatin + a dress shirt + a furniture polish), so the natural learning unit is the item, not the order. New `item_metadata` table keyed by ASIN (preferred) or normalized title.
+
+- At enrichment time, the parser builds the note as a multi-line item list and looks up each item in `item_metadata`. If all items share a known category, the Chase row gets that category. Mixed-category orders stay uncategorized with hints in the note ("atorvastatin → [Medical]; dress shirt → [?]").
+- At categorize time, a checkbox offers "Apply this category to the N unmapped items in this order" — opt-in writes to `item_metadata` only for items that don't already have a different mapping. This prevents a single mixed-category order from silently relearning the wrong thing.
+- A new Maintenance tab "Amazon Items" allows direct edits to `item_metadata`.
+
+### Pending folder cleanup
+
+A file with one un-matchable record stays in `pending/` forever and gets re-parsed on every Ingest run. Maintenance → Pending Folder tab exposes a manual "Move files older than [XX] days to processed/" button (default 180 days). It only runs when the user clicks it — nothing moves automatically.
+
+### Schema changes
+
+- Drop CHECK constraint on `source_file_map.account_type` (idempotent table-rebuild migration in `init_db`) so it can hold `"venmo_detail"`, `"amazon_detail"`, and future detail kinds.
+- Add `source_file_map.discontinued_since` (DATE) and `source_file_map.replaced_by_prefix` (TEXT) for the account-continuity mechanism.
+- Add `item_metadata` table (item_key, display_name, category, subcategory, tax_flags).
 
 ### What it does
 
-- **Venmo:** Matches Chase 5616 "VENMO PAYMENT" rows to records in the monthly Venmo CSV by amount + date (±4 day window). On match, patches the Chase row's `payee` to the real recipient name from the Venmo `To` field, sets `via="Venmo"`, and copies the Venmo `Note` field into the Chase row's `note`.
-- **Amazon:** Matches Chase CC rows to Amazon orders by `order_ref` (already extracted from Chase descriptions at ingest time). On match, populates the Chase row's `note` with the itemized line-items from the order.
-- **Filename convention:** Same shape as Chase. One shared account each — David and Debra share both: `Venmo MM-DD-YYYY to MM-DD-YYYY.csv`, `Amazon MM-DD-YYYY to MM-DD-YYYY.csv`.
-- **Learning loop — Venmo payees:** Once the Chase row's payee becomes "Sylvia Vientulis", the existing `payee_metadata` mechanism takes over. Categorize her once, and next month's Venmo payment to Sylvia auto-categorizes the same way.
-- **Learning loop — Amazon items:** New `item_metadata` table (keyed by ASIN or normalized title). When categorizing a Chase Amazon row, an "Apply this category to the N unmapped items in this order" checkbox records each item's category. Future enrichments use these mappings to auto-categorize orders whose items all resolve to the same category, and to annotate each item in the note with its known category.
-- **Match audit (bidirectional):** Every Enrich-page open re-checks every previously-processed file against the current transactions table and flags:
-  - Detail records that still don't match any Chase row
-  - Chase rows that look unenriched (e.g. payee still "Venmo Payment") despite their date falling inside a processed Venmo file's window
-
-  Items ≤ 14 days old are silent; 14–45 days yellow info; > 45 days red warning. This absorbs month-end straddlers (a Jan 31 Venmo posting to Chase Feb 2) without alarming, while still surfacing genuine mismatches.
-- **Dedup:** Enrichment files are tracked in `processed_files` by SHA-256, same as Chase files. Re-dropping the same file is blocked.
-- **Schema change:** The CHECK constraint on `source_file_map.account_type` is dropped (one-time migration in `init_db`) so the field can hold `"venmo_detail"`, `"amazon_detail"`, plus future detail kinds.
+- Patches Chase row payee + via + note from Venmo file detail
+- Patches Chase row note (and category, when items unanimously resolve) from Amazon order detail
+- Asynchronous-by-default: unresolved records sit in `pending/` and retry every period; nothing requires manual intervention until or unless a file ages out
+- Locks placeholder-payee cells so the user can't accidentally fill them in without data
+- Prevents `payee_metadata` pollution from placeholder payees
+- Tracks account replacements so reissued cards (Chase6190 → Chase12345) don't break matching
+- Warns when prior-period sources are missing in the current input, with four resolution options
+- Idempotent re-application — safe to retry the same pending file across periods
+- Surfaces card-reissue and discontinued-account state in Maintenance
 
 ### What it doesn't do
 
-- **Doesn't ingest Venmo or Amazon dollars as new transactions.** Reports stay accurate because the Chase row is the only record of the spend; enrichment just relabels and annotates.
-- **Doesn't auto-categorize** at apply time except when every Amazon item in an order resolves to one category in `item_metadata`. Mixed-category orders are left for the user.
-- **Doesn't split a Chase Amazon row into per-item sub-transactions.** Item-level learning gets most of the benefit; full splitting remains a future enhancement.
-- **Doesn't overwrite a user-typed `note`** on a Chase row. If `note` is non-empty, enrichment appends rather than replaces.
-- **Doesn't match Venmo card swipes** where `Funding Source` is the Venmo balance instead of a Chase account. These rows are surfaced as "no match expected" rather than as warnings.
+- **Doesn't create new master transactions** from enrichment files. The Chase row is the only record of spend; enrichment relabels and annotates.
+- **Doesn't auto-confirm** transactions. User review remains required before reports.
+- **Doesn't write `payee_metadata` for placeholder payees** like "Venmo Payment." Real names from enrichment do generalize; placeholders don't.
+- **Doesn't allow manual entry of a placeholder-payee row's payee field.** Only enrichment fills these.
+- **Doesn't auto-categorize Amazon orders that span categories.** Mixed orders surface with per-item hints in the note for the user to decide.
+- **Doesn't split a Chase Amazon row into per-item sub-rows.** Item-level learning gets most of the benefit; full splitting remains a future enhancement.
+- **Doesn't overwrite a user-typed `note`** — appends instead.
+- **Doesn't match Venmo card swipes** (Funding Source = Venmo balance, not a Chase account). These are flagged "no match expected" and never block file completion. Debra doesn't use the Venmo card so this is informational only.
+- **Doesn't move pending files automatically based on age.** Cleanup is a manual user action.
 
 ### Things to watch out for / revisit
 
-- **Same-amount Venmo collisions:** Two Venmo payments of the same amount on adjacent days could match the wrong Chase row. Mitigated by closest-date tiebreaker and conflict warnings in the preview. If this turns out to be a recurring problem, add a description- or counterparty-distance tiebreaker.
-- **Audit thresholds (14 / 45 days):** Module constants in `processing/enrich.py`. Tune to taste if month-end timing differs from expectations.
-- **Amazon canonical item key:** Choice between ASIN and normalized title is deferred until a sample Amazon CSV is in hand. ASIN is more reliable but requires it to be present in the export.
-- **`item_metadata` learning from mixed orders:** Today the "Apply to items" checkbox only writes mappings for items that don't already have a *different* mapping. This avoids silently relearning the wrong category for an item that appeared in a mixed order. Behavior may need refinement after real-world use.
-- **Audit re-parse cost:** Every Enrich-page open re-parses every previously-processed enrichment file. Fine while file counts are small (one per month per source); if it grows, cache results in a table.
-- **Existing Chase normalization rule for "VENMO PAYMENT":** Stays in place. Enrichment runs after normalize and overwrites the placeholder payee. For months where no Venmo file is supplied, the placeholder remains and the user categorizes manually (likely as Payments → Venmo and Zelle).
-- **Future: transaction splitting.** When/if implemented, Amazon enrichment will likely want to split a Chase row into per-item sub-rows directly, retiring the single-category-per-order pattern.
+- **Default-category misclassification.** If `DEFAULT_CATEGORY_PATTERNS` accidentally matches a Chase row that isn't actually Venmo or Amazon, the default category will be wrong. Patterns are conservative ("VENMO PAYMENT" is unambiguous; Amazon patterns reuse the established `_extract_order_ref` regexes).
+- **Same-amount Venmo collisions.** Two payments of the same amount on adjacent days could match the wrong Chase row. Mitigated by closest-date tiebreaker and conflict warnings in preview. If recurring, add a description-distance tiebreaker.
+- **Amazon canonical item key.** ASIN vs. normalized title — deferred until a sample Amazon CSV is available. ASIN is more reliable but requires the export to include it.
+- **`item_metadata` learning from mixed orders.** Today the "Apply to items" checkbox only writes mappings for items that don't already have a *different* mapping, to avoid silently relearning the wrong category. May need refinement after real-world use.
+- **Pending folder accumulation.** Files that never fully match grow over time. Manual cleanup tool exists; if it gets unwieldy, consider an automatic age-based archive.
+- **Account replacement during a partially-enriched period.** Cross-period matching needs to traverse `replaced_by_prefix` chains. Spec'd; implementation must handle the chain walk carefully.
+- **Future: transaction splitting.** If/when implemented, Amazon enrichment would split a Chase row into per-item sub-rows directly, retiring the single-category-per-order pattern.
 
 ---
 
