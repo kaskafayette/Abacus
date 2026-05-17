@@ -421,10 +421,49 @@ Abacus/
 
 ---
 
+## Detail-File Enrichment (Venmo & Amazon)
+
+Some source files don't represent new transactions — they add missing detail to Chase rows that already exist. Venmo and Amazon are both this shape. Abacus handles them through a generalized enrichment pipeline (`processing/enrich.py`), separate from the main ingest pipeline. A new **Enrich** page in the sidebar sits between Ingest and Normalize & Categorize.
+
+### What it does
+
+- **Venmo:** Matches Chase 5616 "VENMO PAYMENT" rows to records in the monthly Venmo CSV by amount + date (±4 day window). On match, patches the Chase row's `payee` to the real recipient name from the Venmo `To` field, sets `via="Venmo"`, and copies the Venmo `Note` field into the Chase row's `note`.
+- **Amazon:** Matches Chase CC rows to Amazon orders by `order_ref` (already extracted from Chase descriptions at ingest time). On match, populates the Chase row's `note` with the itemized line-items from the order.
+- **Filename convention:** Same shape as Chase. One shared account each — David and Debra share both: `Venmo MM-DD-YYYY to MM-DD-YYYY.csv`, `Amazon MM-DD-YYYY to MM-DD-YYYY.csv`.
+- **Learning loop — Venmo payees:** Once the Chase row's payee becomes "Sylvia Vientulis", the existing `payee_metadata` mechanism takes over. Categorize her once, and next month's Venmo payment to Sylvia auto-categorizes the same way.
+- **Learning loop — Amazon items:** New `item_metadata` table (keyed by ASIN or normalized title). When categorizing a Chase Amazon row, an "Apply this category to the N unmapped items in this order" checkbox records each item's category. Future enrichments use these mappings to auto-categorize orders whose items all resolve to the same category, and to annotate each item in the note with its known category.
+- **Match audit (bidirectional):** Every Enrich-page open re-checks every previously-processed file against the current transactions table and flags:
+  - Detail records that still don't match any Chase row
+  - Chase rows that look unenriched (e.g. payee still "Venmo Payment") despite their date falling inside a processed Venmo file's window
+
+  Items ≤ 14 days old are silent; 14–45 days yellow info; > 45 days red warning. This absorbs month-end straddlers (a Jan 31 Venmo posting to Chase Feb 2) without alarming, while still surfacing genuine mismatches.
+- **Dedup:** Enrichment files are tracked in `processed_files` by SHA-256, same as Chase files. Re-dropping the same file is blocked.
+- **Schema change:** The CHECK constraint on `source_file_map.account_type` is dropped (one-time migration in `init_db`) so the field can hold `"venmo_detail"`, `"amazon_detail"`, plus future detail kinds.
+
+### What it doesn't do
+
+- **Doesn't ingest Venmo or Amazon dollars as new transactions.** Reports stay accurate because the Chase row is the only record of the spend; enrichment just relabels and annotates.
+- **Doesn't auto-categorize** at apply time except when every Amazon item in an order resolves to one category in `item_metadata`. Mixed-category orders are left for the user.
+- **Doesn't split a Chase Amazon row into per-item sub-transactions.** Item-level learning gets most of the benefit; full splitting remains a future enhancement.
+- **Doesn't overwrite a user-typed `note`** on a Chase row. If `note` is non-empty, enrichment appends rather than replaces.
+- **Doesn't match Venmo card swipes** where `Funding Source` is the Venmo balance instead of a Chase account. These rows are surfaced as "no match expected" rather than as warnings.
+
+### Things to watch out for / revisit
+
+- **Same-amount Venmo collisions:** Two Venmo payments of the same amount on adjacent days could match the wrong Chase row. Mitigated by closest-date tiebreaker and conflict warnings in the preview. If this turns out to be a recurring problem, add a description- or counterparty-distance tiebreaker.
+- **Audit thresholds (14 / 45 days):** Module constants in `processing/enrich.py`. Tune to taste if month-end timing differs from expectations.
+- **Amazon canonical item key:** Choice between ASIN and normalized title is deferred until a sample Amazon CSV is in hand. ASIN is more reliable but requires it to be present in the export.
+- **`item_metadata` learning from mixed orders:** Today the "Apply to items" checkbox only writes mappings for items that don't already have a *different* mapping. This avoids silently relearning the wrong category for an item that appeared in a mixed order. Behavior may need refinement after real-world use.
+- **Audit re-parse cost:** Every Enrich-page open re-parses every previously-processed enrichment file. Fine while file counts are small (one per month per source); if it grows, cache results in a table.
+- **Existing Chase normalization rule for "VENMO PAYMENT":** Stays in place. Enrichment runs after normalize and overwrites the placeholder payee. For months where no Venmo file is supplied, the placeholder remains and the user categorizes manually (likely as Payments → Venmo and Zelle).
+- **Future: transaction splitting.** When/if implemented, Amazon enrichment will likely want to split a Chase row into per-item sub-rows directly, retiring the single-category-per-order pattern.
+
+---
+
 ## Future Enhancements (Out of Scope for v1)
 
-1. **Amazon order matching:** Order reference codes are already extracted and stored in `order_ref`. Future: scrape Amazon order detail and match by reference code to categorize individual items within an Amazon order.
-2. **Supplemental source ingestion:** Import Venmo transaction detail and Zelle detail to resolve ambiguous descriptions.
+1. ~~**Amazon order matching:**~~ Now implemented as part of Detail-File Enrichment above.
+2. ~~**Supplemental source ingestion (Venmo):**~~ Now implemented as part of Detail-File Enrichment above. Zelle detail import remains future work if a Zelle CSV export becomes available.
 3. **Transaction splitting:** Allow a single transaction to be split into multiple sub-rows with different categories.
 4. **Payor reporting:** Report showing spending by category broken out by payor.
 5. **AG Grid for Browse/Search:** The Category Assignment and Maintenance screens already use streamlit-aggrid. The Browse/Search screen still uses st.dataframe - could be upgraded to AG Grid for inline editing of all fields. If a full framework change is ever warranted, NiceGUI is the closest alternative to Streamlit with native AG Grid support.
