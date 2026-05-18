@@ -132,14 +132,13 @@ def browse_page(conn):
         )
 
     # --- Sortable, scrollable table with row selection ---
+    # Apply consistent UI convention: credits in green, signed currency format.
+    from ui._amount_style import styler_for_amount_column
     selection = st.dataframe(
-        df,
+        styler_for_amount_column(df, "Amount"),
         use_container_width=True,
         hide_index=True,
         height=500,
-        column_config={
-            "Amount": st.column_config.NumberColumn(format="$%.2f"),
-        },
         on_select="rerun",
         selection_mode="single-row",
         key="browse_table",
@@ -164,9 +163,12 @@ def browse_page(conn):
 
 
 def _fmt_browse_amt(val):
-    if val >= 0:
-        return f"${val:,.2f}"
-    return f"-${abs(val):,.2f}"
+    if val > 0:
+        # Credit — render in green via Streamlit markdown color span
+        return f":green[\\${val:,.2f}]"
+    if val < 0:
+        return f"-${abs(val):,.2f}"
+    return f"${val:,.2f}"
 
 
 def _df_to_excel(df: pd.DataFrame) -> bytes:

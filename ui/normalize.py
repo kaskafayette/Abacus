@@ -18,6 +18,98 @@ from processing.placeholders import (
 from processing.reports import generate_pending_items_pdf
 
 
+def _ai_classify_section(conn):
+    """Render the 'Ask Claude' UI for AI-suggested categorization.
+
+    Shows the count of pending rows that have a payee but no category, and
+    a button that batches them off to the Anthropic API. Suggestions land
+    on the transactions immediately with a [AI: ...] marker in the note;
+    the user reviews them in the grid below and edits before Save Categorized.
+    """
+    import os
+    candidates = conn.execute("""
+        SELECT COUNT(DISTINCT payee) AS unique_payees,
+               COUNT(*) AS rows
+        FROM transactions
+        WHERE status = 'pending'
+          AND payee IS NOT NULL AND payee != ''
+          AND category IS NULL
+    """).fetchone()
+    n_payees = candidates["unique_payees"] or 0
+    n_rows = candidates["rows"] or 0
+
+    if n_payees == 0:
+        return  # nothing to ask Claude about
+
+    api_key_set = bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+    with st.expander(
+        f"🤖 Ask Claude to suggest categories for {n_payees} unmapped payee(s) "
+        f"({n_rows} row(s))",
+        expanded=False,
+    ):
+        st.caption(
+            "Sends payee names (and any transaction notes) to Claude, which "
+            "returns a suggested category and subcategory for each. Suggestions "
+            "land on the transactions in the grid below with an [AI: ...] tag "
+            "in the note so you know which ones to double-check. You then "
+            "review and edit before clicking **Save Categorized**."
+        )
+        if not api_key_set:
+            st.error(
+                "**ANTHROPIC_API_KEY environment variable is not set.** Get a "
+                "key at console.anthropic.com (a $5 balance covers years of "
+                "typical use), set it as a system environment variable, and "
+                "restart Streamlit. See the project memory for setup details."
+            )
+            return
+
+        if st.button("Get AI suggestions", key="ai_classify_go"):
+            with st.spinner(f"Asking Claude about {n_payees} payee(s)..."):
+                try:
+                    from processing.ai_classify import classify_pending_unmapped
+                    result = classify_pending_unmapped(conn)
+                    n_applied = result["applied"]
+                    n_classified = result["payees_classified"]
+                    warnings = result.get("warnings", [])
+
+                    # Stash warnings for display after rerun
+                    if warnings:
+                        st.session_state.ai_classify_warnings = warnings
+
+                    st.success(
+                        f"Got suggestions for {n_classified} payee(s); applied "
+                        f"to {n_applied} pending row(s). Review the grid below "
+                        f"— each suggested row has an [AI: ...] tag in its note."
+                    )
+                    st.session_state.pop("cat_auto_done", None)
+                    st.rerun()
+                except RuntimeError as e:
+                    st.error(f"AI classification failed: {e}")
+                except Exception as e:
+                    st.error(f"Unexpected error: {type(e).__name__}: {e}")
+
+    # Show any warnings from the previous run (out-of-DB categories/subcategories
+    # that were rejected or cleaned up before being applied).
+    warnings = st.session_state.get("ai_classify_warnings")
+    if warnings:
+        with st.expander(
+            f"⚠ {len(warnings)} validation warning(s) from the last AI run "
+            "(click to expand)",
+            expanded=False,
+        ):
+            st.caption(
+                "These suggestions were rejected or cleaned up because they "
+                "didn't match a valid category/subcategory in your database. "
+                "No invalid values were written to any transaction."
+            )
+            for w in warnings:
+                st.write(f"- {w}")
+            if st.button("Dismiss warnings", key="ai_dismiss_warnings"):
+                st.session_state.pop("ai_classify_warnings", None)
+                st.rerun()
+
+
 def _render_renormalize_guard(conn, key_prefix: str):
     """Render the typed-phrase guard for the destructive Re-run All Normalization
     action. The action clears payee and via on every pending/needs_review
@@ -252,6 +344,9 @@ def _categorization(conn):
         if auto_count:
             st.info(f"Auto-categorized {auto_count} transaction(s) from payee metadata.")
 
+    # AI-assist: classify any unmapped pending rows via Claude.
+    _ai_classify_section(conn)
+
     # Awaiting-enrichment banner (rows whose payee will come from an enrichment
     # file — they're hidden from this tab until that file is applied).
     if ENRICHMENT_VIAS:
@@ -420,9 +515,11 @@ def _categorization(conn):
     else:
         gb.configure_column("# Txns", hide=True)
     gb.configure_column("Last Date", width=100)
+    from ui._amount_style import amount_cell_style, amount_value_formatter
     gb.configure_column("Total", width=100,
                         type=["numericColumn"],
-                        valueFormatter=JsCode("function(params) { return '$' + params.value.toFixed(2); }"))
+                        valueFormatter=amount_value_formatter(),
+                        cellStyle=amount_cell_style())
     if "_id" in df.columns:
         gb.configure_column("_id", hide=True)
 

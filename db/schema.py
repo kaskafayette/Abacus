@@ -130,6 +130,7 @@ SEED_CATEGORIES = [
     ("Household", "Subscriptions", None),
     ("Household", "Capital Improvements", "Capital Improvements"),
     ("Household", "Office", None),
+    ("Household", "Clothing", None),
     # Fun
     ("Fun", "Restaurants", None),
     ("Fun", "Tickets and Other", None),

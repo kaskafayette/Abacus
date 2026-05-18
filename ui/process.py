@@ -204,7 +204,9 @@ def _show_ingestion_preview(conn):
                 "Order Ref": t["order_ref"] or "",
             })
         df = pd.DataFrame(display)
-        st.dataframe(df, use_container_width=True, height=400)
+        from ui._amount_style import styler_for_amount_column
+        st.dataframe(styler_for_amount_column(df, "Amount"),
+                     use_container_width=True, height=400)
 
     col1, col2 = st.columns(2)
     with col1:
@@ -751,8 +753,10 @@ def _render_summary_table(summary):
             "Reason": prop.reason,
         })
     if rows_matched:
+        from ui._amount_style import styler_for_amount_column
         st.markdown("**Matched (will be applied):**")
-        st.dataframe(pd.DataFrame(rows_matched), use_container_width=True,
+        st.dataframe(styler_for_amount_column(pd.DataFrame(rows_matched), "Amount"),
+                     use_container_width=True,
                      hide_index=True, height=min(35 * (len(rows_matched) + 1) + 3, 300))
 
     rows_unmatched = []

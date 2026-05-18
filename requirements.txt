@@ -3,3 +3,4 @@ streamlit-aggrid
 fpdf2
 openpyxl
 pandas
+anthropic

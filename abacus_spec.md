@@ -472,6 +472,10 @@ Chase ingest normalizes "VENMO PAYMENT" descriptions to the payee "Venmo Payment
 
 Once enrichment patches a Chase row's payee to "Sylvia Vientulis," the existing `payee_metadata` mechanism takes over. Categorize Sylvia once and next month's Venmo payment to her auto-categorizes. No special wiring — `apply_matches` triggers the auto-categorize pass on affected rows immediately after patching.
 
+### AI-assisted payee categorization
+
+For pending transactions that have a payee but no category (most often: brand-new payees you've never categorized before, or post-enrichment Venmo rows where the recipient is new), the Categorize tab has an "🤖 Ask Claude" expander that batch-sends them to the Anthropic API and gets back a category + subcategory + confidence per payee. The suggestions land on the transactions with an `[AI: <confidence> — <reasoning>]` marker appended to the note so you can spot which categories Claude chose; you review and edit in the grid before clicking Save Categorized. Requires an `ANTHROPIC_API_KEY` from console.anthropic.com (separate from any Claude.ai subscription). Implementation: `processing/ai_classify.py`. Costs under $1/year at typical household volume.
+
 ### Learning loop — Amazon items
 
 A single Amazon order can span categories (atorvastatin + a dress shirt + a furniture polish), so the natural learning unit is the item, not the order. New `item_metadata` table keyed by ASIN (preferred) or normalized title.
@@ -530,7 +534,33 @@ A file with one un-matchable record stays in `pending/` forever and gets re-pars
 
 Concrete work that's queued and committed — has a clear path, just hasn't been built yet. A future session can pick any of these up without re-deriving context.
 
-1. **Amazon screen-scraper to produce the CSV.** Amazon doesn't expose a download for order history the way Chase and Venmo do — there's no "export to CSV" button. So before Abacus can enrich Amazon orders, we need a separate tool that logs into Amazon's website, walks the order-history pages, and writes out a CSV in the format the Amazon enricher expects. This scraper is the prerequisite for items 2 and 3; without it, Amazon stays a single Chase row labeled just "Amazon" with no visibility into what was actually purchased.
+1. **Amazon order scraper.** Amazon doesn't offer an order-history export, so we need a small tool that pulls the data ourselves. Recommended implementation: a **browser bookmarklet** — a one-line JavaScript snippet saved as a browser bookmark. Workflow per use: log into amazon.com normally, navigate to Your Orders, filter to the desired date range, click the bookmarklet, save the downloaded CSV into `input/`. Once a month, takes about a minute. Trade-off: brittle to Amazon's DOM changes (might need a small fix every year or two), but zero install, no anti-bot concerns, no TOS exposure since it runs in your own logged-in session.
+
+   Alternative if the bookmarklet becomes painful: **Playwright in Python** with a visible browser window — full automation, but heavier setup (`pip install playwright; playwright install chromium`) and overkill for monthly use.
+
+   **Pagination:** monthly volume can easily exceed a single Amazon orders page (e.g. ~10 orders/page is the default; YTD scrapes might span 12+ pages). The bookmarklet must walk pages itself, not rely on the user clicking Next manually. Two viable approaches:
+
+   - **Auto-paginate via `fetch()`** (preferred): from the current logged-in page context, fetch subsequent pages directly using Amazon's `?startIndex=N` pagination URL pattern. Parse each fetched page's HTML, accumulate orders, stop when a fetched page is empty or the date-range boundary is crossed. Include a small inter-request delay (~300ms) to stay polite and avoid throttling. For 113 orders this completes in roughly 5-10 seconds.
+   - **Single-page after raising page size**: if Amazon's UI honors a `?items_per_page=100` (or similar) URL parameter to show all orders on one page, the user navigates with that param first, then the bookmarklet scrapes once without pagination logic. Less reliable because Amazon controls whether the param is honored.
+
+   Build the bookmarklet around auto-pagination as the primary path; the page-size hack is a nice-to-have fallback.
+
+   **CSV output format the bookmarklet must produce** (matches the enricher's expected schema):
+
+   - Filename: `Amazon MM-DD-YYYY to MM-DD-YYYY.csv` (same convention as other Abacus inputs)
+   - One row per item (not per order). Multiple items in the same order share the same Order ID.
+   - Columns:
+     - `Order ID` — Amazon's order reference (e.g. `113-1234567-1234567`). This is what `order_ref` matches against on the Chase side.
+     - `Order Date` — date the order was placed
+     - `Order Total` — total of the full order (same on every row for that order)
+     - `Item Title` — human-readable name (e.g. "Atorvastatin Calcium 20mg Tablets, 30 Count")
+     - `ASIN` — Amazon's internal product identifier (the preferred `item_key` for `item_metadata`)
+     - `Item Price` — per-unit price
+     - `Item Quantity` — number ordered
+     - `Item Category` — Amazon's top-level department from the product-page breadcrumb (e.g. "Books", "Clothing, Shoes & Jewelry", "Health & Household"). **Optional in v1** — leave blank if the bookmarklet doesn't fetch product pages. Adding breadcrumb capture is a v2 enhancement: it requires the bookmarklet to follow each item's product link, scrape the breadcrumb, then come back. Slower, but provides a clean Abacus-category mapping path (Books → Fun → Tickets and Other, Clothing → Shopping, Health → Health and Wellness, etc.) that reduces manual categorization.
+     - `Seller` — third-party seller name if applicable, blank for items sold by Amazon directly (optional)
+
+   This scraper is the prerequisite for items 2 and 3; without it, Amazon stays as a single Chase row labeled just "Amazon" with no visibility into what was actually purchased.
 2. **Amazon enrichment parser.** Once the screen-scraper exists, implement `parse_amazon()` in `processing/enrich.py` and register it with `@register_enricher("amazon_detail", match_strategy="order_ref")`. Most of the plumbing is already in place: the registry pattern, the `item_metadata` table, the order_ref extraction from Chase descriptions, and the matching strategy. The remaining work is the parser function itself plus a decision about how to identify items uniquely — by ASIN (Amazon's internal product code, most reliable) or by normalized item title (works even if ASIN isn't in the export).
 3. **Amazon item-level learning UI.** Once Amazon enrichment lands, two pieces of UI are needed. First, a checkbox in the Categorize tab labeled "Apply this category to the N unmapped items in this order" — when you categorize an Amazon order, that checkbox writes per-item category mappings into `item_metadata` so future orders containing the same item auto-categorize. Second, a new tab in Maintenance called "Amazon Items" that lets you view and edit `item_metadata` directly (e.g. to fix a wrong category that got learned from a mixed-category order). Detailed designs are in the Detail-File Enrichment section above.
 4. **Auto-fill tax flags from category.** Categories already have a `tax_flag_default` column in the database — for example Medical maps to the "Medical" tax flag, Donations → Deductible maps to "Donations - Deductible". Today the user has to set the tax flag manually after picking a category. The fix: when you pick a category that has a default tax flag, the tax flag field auto-populates with that default. If you've already set the tax flag manually for a row, it's left alone. Saves clicks and reduces the chance of forgetting to set a tax flag on a deductible item.

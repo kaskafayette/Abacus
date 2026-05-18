@@ -384,6 +384,155 @@ def _category_master(conn):
 # Rename / Merge Payees
 # ---------------------------------------------------------------------------
 
+def _ai_near_miss_section(conn):
+    """🤖 Check Normalizations — uses Claude to find near-miss duplicate payees
+    and lets the user merge each group with one click.
+    """
+    import os
+    payee_count = conn.execute(
+        "SELECT COUNT(DISTINCT payee) AS c FROM transactions "
+        "WHERE payee IS NOT NULL AND payee != ''"
+    ).fetchone()["c"]
+
+    if payee_count < 2:
+        return  # nothing to check
+
+    api_key_set = bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+    with st.expander(
+        f"🤖 Check {payee_count} payees for near-miss duplicates (uses Claude)",
+        expanded=False,
+    ):
+        st.caption(
+            "Asks Claude to scan your distinct payees and flag groups that "
+            "look like the same merchant under different spellings "
+            "(e.g. \"Martha's\", \"Martha Bros\", \"Martha's Coffee\"). "
+            "For each group you can pick a canonical name and click Merge — "
+            "all variants get renamed across transactions, normalization rules, "
+            "and payee_metadata in one step. Or click Leave Separate to dismiss "
+            "the suggestion."
+        )
+        if not api_key_set:
+            st.error(
+                "**ANTHROPIC_API_KEY environment variable is not set.** Get a key "
+                "at console.anthropic.com and set it as a system environment "
+                "variable, then restart Streamlit."
+            )
+            return
+
+        col_run, col_clear = st.columns([1, 1])
+        if col_run.button("Check Normalizations", key="ai_near_miss_go",
+                           type="primary"):
+            with st.spinner(f"Asking Claude about {payee_count} payees..."):
+                try:
+                    from processing.ai_near_miss import find_near_miss_groups
+                    groups, warnings = find_near_miss_groups(conn)
+                    st.session_state.ai_near_miss_groups = [g.model_dump() for g in groups]
+                    st.session_state.ai_near_miss_warnings = warnings
+                    # Reset any per-group dismissals from previous runs
+                    st.session_state.ai_near_miss_dismissed = set()
+                    st.rerun()
+                except RuntimeError as e:
+                    st.error(f"AI check failed: {e}")
+                except Exception as e:
+                    st.error(f"Unexpected error: {type(e).__name__}: {e}")
+
+        if col_clear.button("Clear Results", key="ai_near_miss_clear",
+                             disabled=("ai_near_miss_groups" not in st.session_state)):
+            st.session_state.pop("ai_near_miss_groups", None)
+            st.session_state.pop("ai_near_miss_warnings", None)
+            st.session_state.pop("ai_near_miss_dismissed", None)
+            st.rerun()
+
+        # Render results from the most recent run
+        groups = st.session_state.get("ai_near_miss_groups")
+        if groups is None:
+            return
+
+        warnings = st.session_state.get("ai_near_miss_warnings", [])
+        dismissed = st.session_state.get("ai_near_miss_dismissed", set())
+        active_groups = [g for i, g in enumerate(groups) if i not in dismissed]
+
+        if not active_groups and not warnings:
+            st.info("✅ No near-miss duplicates found by Claude.")
+            return
+
+        if active_groups:
+            st.markdown(f"**{len(active_groups)} suggested group(s):**")
+
+        # Distinct-payee counts so we can show "X transactions" per member
+        counts = dict(conn.execute(
+            "SELECT payee, COUNT(*) FROM transactions "
+            "WHERE payee IS NOT NULL GROUP BY payee"
+        ).fetchall())
+
+        for i, g in enumerate(groups):
+            if i in dismissed:
+                continue
+            members = g["members"]
+            canonical_default = g["canonical"]
+            confidence = g["confidence"]
+            reasoning = g["reasoning"]
+
+            with st.container(border=True):
+                conf_color = "green" if confidence == "high" else "orange"
+                st.markdown(
+                    f"**Group {i+1}** — confidence: :{conf_color}[{confidence}]"
+                )
+                st.caption(reasoning)
+                # Show members with counts
+                for m in members:
+                    cnt = counts.get(m, 0)
+                    marker = "→ canonical" if m == canonical_default else ""
+                    st.write(f"  - **{m}** ({cnt} txns) {marker}")
+
+                # Let the user pick a different canonical if they prefer
+                canonical_choice = st.selectbox(
+                    "Merge all into:",
+                    members,
+                    index=members.index(canonical_default),
+                    key=f"nm_canonical_{i}",
+                )
+
+                col_m, col_l, _ = st.columns([1, 1, 3])
+                if col_m.button("Merge", type="primary", key=f"nm_merge_{i}"):
+                    # Rename every non-canonical member to the chosen canonical
+                    merged_count = 0
+                    for m in members:
+                        if m == canonical_choice:
+                            continue
+                        _execute_rename(conn, m, canonical_choice)
+                        merged_count += 1
+                    dismissed.add(i)
+                    st.session_state.ai_near_miss_dismissed = dismissed
+                    st.success(
+                        f"Merged {merged_count} variant(s) into "
+                        f"{canonical_choice!r}."
+                    )
+                    st.rerun()
+
+                if col_l.button("Leave Separate", key=f"nm_leave_{i}"):
+                    dismissed.add(i)
+                    st.session_state.ai_near_miss_dismissed = dismissed
+                    st.rerun()
+
+        if warnings:
+            with st.expander(
+                f"⚠ {len(warnings)} validation warning(s) from Claude's response",
+                expanded=False,
+            ):
+                st.caption(
+                    "These groups were rejected before reaching you because "
+                    "they didn't pass the validation checks (e.g. canonical "
+                    "wasn't one of the members, or a member name didn't match "
+                    "a real distinct payee). No data was modified."
+                )
+                for w in warnings:
+                    st.write(f"- {w}")
+
+    st.divider()
+
+
 def _rename_merge_payees(conn):
     st.subheader("Rename / Merge Payees")
     st.caption(
@@ -391,6 +540,9 @@ def _rename_merge_payees(conn):
         "(e.g. 'State Farm' + 'State Farm Insurance' -> 'State Farm Insurance'). "
         "Updates transactions, normalization rules, and payee metadata all at once."
     )
+
+    # AI-assisted near-miss duplicate detection
+    _ai_near_miss_section(conn)
 
     # Get all distinct payee names from transactions
     payee_rows = conn.execute(
@@ -565,9 +717,11 @@ def _edit_transactions(conn):
                         cellEditor="agSelectCellEditor",
                         cellEditorParams={"values": [""] + category_names})
     gb.configure_column("Subcategory", editable=True, width=140)
+    from ui._amount_style import amount_cell_style, amount_value_formatter
     gb.configure_column("Amount", width=90,
                         type=["numericColumn"],
-                        valueFormatter=JsCode("function(params) { return '$' + params.value.toFixed(2); }"))
+                        valueFormatter=amount_value_formatter(),
+                        cellStyle=amount_cell_style())
     tax_flag_values = [
         "", "Tax-reportable", "Reimbursable", "Capital Improvements",
         "Home Office", "Donations - Deductible", "Medical", "Business Expense",
