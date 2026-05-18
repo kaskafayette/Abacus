@@ -1,4 +1,4 @@
-"""Ingest — file validation, template setup, and CSV ingestion."""
+"""Ingest — file validation, template setup, CSV ingestion, and enrichment."""
 
 import streamlit as st
 import pandas as pd
@@ -9,6 +9,11 @@ from db import queries
 from processing.ingest import (
     INPUT_DIR, validate_all_files, read_csv_headers, parse_filename,
     ingest_file, parse_file_with_template, FileValidationResult,
+    check_cross_source_completeness,
+)
+from processing.enrich import (
+    PENDING_DIR, route_input_files, scan_pending, commit_pending,
+    list_pending_status, is_enricher_kind, enricher_account_types,
 )
 
 STEPS = ["File Validation", "Template Setup"]
@@ -31,6 +36,11 @@ def process_page(conn):
     elif step == 2:
         _step2_template(conn)
 
+    # Enrichment section — always visible at the bottom of the Ingest page.
+    # Shows pending/ contents, lets the user preview and apply matches.
+    st.divider()
+    _enrichment_section(conn)
+
 
 # ---------------------------------------------------------------------------
 # Step 1 — File Validation
@@ -41,52 +51,45 @@ def _step1_validation(conn):
 
     with st.expander("Instructions"):
         st.markdown(
-            "1. Place your CSV bank/credit card export files in the **input/** folder.\n"
-            "2. Files must be named: **`<account-prefix> MM-DD-YYYY to MM-DD-YYYY.csv`**\n"
-            "   - Example: `Chase5616 01-01-2026 to 02-28-2026.csv`\n"
-            "   - Extra spaces between the prefix and dates are OK.\n"
-            "3. The prefix must match a known account, or a new one will be set up.\n"
-            "4. Click **Check Input Files** below to scan the input folder."
+            "1. Place your CSV files in the **input/** folder.\n"
+            "2. Filename format: **`<account-prefix> MM-DD-YYYY to MM-DD-YYYY.csv`**\n"
+            "   - Bank/CC examples: `Chase5616 01-01-2026 to 02-28-2026.csv`\n"
+            "   - Enrichment examples: `Venmo 01-01-2026 to 01-31-2026.csv`, "
+            "`Amazon 01-01-2026 to 01-31-2026.csv`\n"
+            "3. Click **Check Input Files** to scan, auto-route enrichment files to "
+            "`pending/`, and warn about anything new or missing.\n"
+            "4. Bank/CC files proceed through validation → preview → commit.\n"
+            "5. Enrichment files are reviewed and applied at the bottom of this page."
         )
 
-    # --- Phase 1: scan for files ---
+    # --- Phase 1: scan + classify + route ---
     if st.button("Check Input Files"):
-        INPUT_DIR.mkdir(exist_ok=True)
-        csv_files = sorted(f for f in INPUT_DIR.iterdir() if f.suffix.lower() == ".csv")
+        _scan_and_route(conn)
 
-        if not csv_files:
-            st.warning("No CSV files found in the input folder.")
-            return
+    # If unknown prefixes were detected, force the continuity prompt before
+    # anything else can proceed.
+    unknown = st.session_state.get("unknown_prefixes", [])
+    if unknown:
+        _continuity_prompt(conn, unknown)
+        return
 
-        parsed_files = []
-        all_starts = []
-        all_ends = []
-        for fp in csv_files:
-            parsed = parse_filename(fp.name)
-            parsed_files.append((fp.name, parsed))
-            if parsed:
-                all_starts.append(parsed["start_date"])
-                all_ends.append(parsed["end_date"])
-
-        st.session_state.scanned_files = parsed_files
-
-        if all_starts and all_ends:
-            st.session_state.period_start = min(all_starts)
-            st.session_state.period_end = max(all_ends)
+    # Show cross-source missing-account warnings if any.
+    missing = st.session_state.get("missing_sources", [])
+    if missing:
+        _missing_source_prompt(conn, missing)
+        return
 
     scanned = st.session_state.get("scanned_files")
     if not scanned:
         return
 
-    valid_count = sum(1 for _, p in scanned if p is not None)
-    st.success(f"Found **{valid_count}** valid input file(s):")
-    for fname, parsed in scanned:
-        if parsed:
-            st.write(f"  - `{fname}` — {parsed['prefix']}, {parsed['start_date']} to {parsed['end_date']}")
-        else:
-            st.error(f"  - `{fname}` — does not match expected filename format")
+    routed_summary = st.session_state.get("routing_summary")
+    if routed_summary:
+        _show_routing_summary(routed_summary)
 
+    valid_count = sum(1 for _, p in scanned if p is not None)
     if valid_count == 0:
+        st.warning("No ingest-type files to process. Enrichment-only? See section below.")
         return
 
     # --- Phase 2: validate with dates ---
@@ -218,6 +221,7 @@ def _commit_ingestion(conn):
     results = st.session_state.get("validation_results", [])
     ingested = 0
     total_txns = 0
+    total_skipped = 0
     for r in results:
         if not r.parsed or r.errors:
             continue
@@ -229,17 +233,255 @@ def _commit_ingestion(conn):
             st.error(f"No template for {r.parsed['prefix']} — skipping.")
             continue
         try:
-            txns = ingest_file(conn, filepath, template)
+            fresh, skipped = ingest_file(conn, filepath, template)
             ingested += 1
-            total_txns += len(txns)
-        except ValueError as e:
-            st.error(str(e))
+            total_txns += len(fresh)
+            total_skipped += skipped
+        except Exception as e:
+            st.error(f"{filepath.name}: {e}")
             return
 
     st.session_state.pop("ingestion_preview", None)
     st.session_state.pop("validation_results", None)
     st.session_state.pop("scanned_files", None)
-    st.success(f"Ingested {ingested} file(s), {total_txns} transaction(s). Go to **Normalize & Categorize** to continue.")
+    st.session_state.pop("routing_summary", None)
+    msg = f"Ingested {ingested} file(s), {total_txns} new transaction(s)."
+    if total_skipped:
+        msg += f" Skipped {total_skipped} duplicate row(s) (overlap from prior periods)."
+    msg += " Scroll down to apply pending enrichments, then go to **Normalize & Categorize**."
+    st.success(msg)
+
+
+# ---------------------------------------------------------------------------
+# Scan + route + continuity + missing-source helpers
+# ---------------------------------------------------------------------------
+
+def _scan_and_route(conn):
+    """Scan input/, identify unknown prefixes, route enrichment files, and run
+    the cross-source completeness check. Populates session state for the
+    downstream UI to consume.
+    """
+    INPUT_DIR.mkdir(exist_ok=True)
+    csv_files = sorted(f for f in INPUT_DIR.iterdir() if f.suffix.lower() == ".csv")
+    if not csv_files:
+        st.warning("No CSV files found in the input folder.")
+        return
+
+    # First pass: identify any unknown prefixes BEFORE routing, so the user
+    # can resolve them via the continuity prompt.
+    unknown = []
+    for fp in csv_files:
+        parsed = parse_filename(fp.name)
+        if not parsed:
+            continue
+        prefix = parsed["prefix"]
+        if queries.get_account_type(conn, prefix) is None:
+            unknown.append((fp.name, prefix))
+
+    if unknown:
+        # Deduplicate by prefix — multiple files might share the same new prefix.
+        seen = set()
+        deduped = []
+        for fname, prefix in unknown:
+            if prefix not in seen:
+                seen.add(prefix)
+                deduped.append((fname, prefix))
+        st.session_state.unknown_prefixes = deduped
+        st.session_state.scanned_files = None
+        st.session_state.routing_summary = None
+        st.session_state.missing_sources = None
+        st.rerun()
+        return
+
+    # No unknown prefixes — route enrich-type files to pending/.
+    routing = route_input_files(conn)
+    st.session_state.routing_summary = routing
+
+    # Re-scan input/ after routing (enrichment files are now gone)
+    csv_files = sorted(f for f in INPUT_DIR.iterdir() if f.suffix.lower() == ".csv")
+    parsed_files = []
+    all_starts, all_ends = [], []
+    for fp in csv_files:
+        parsed = parse_filename(fp.name)
+        parsed_files.append((fp.name, parsed))
+        if parsed:
+            all_starts.append(parsed["start_date"])
+            all_ends.append(parsed["end_date"])
+    st.session_state.scanned_files = parsed_files
+    if all_starts and all_ends:
+        st.session_state.period_start = min(all_starts)
+        st.session_state.period_end = max(all_ends)
+
+    # Cross-source completeness check
+    current_prefixes = set()
+    for _, p in parsed_files:
+        if p:
+            current_prefixes.add(p["prefix"])
+    # Include prefixes of enrichment files we just moved to pending/
+    for fname in routing["enrich_moved"]:
+        p = parse_filename(fname)
+        if p:
+            current_prefixes.add(p["prefix"])
+    # Plus enrichment files already sitting in pending/ from prior periods
+    for status in list_pending_status(conn):
+        current_prefixes.add(status["prefix"])
+    missing = check_cross_source_completeness(conn, current_prefixes)
+    if missing:
+        st.session_state.missing_sources = missing
+    else:
+        st.session_state.missing_sources = []
+
+    st.rerun()
+
+
+def _show_routing_summary(routing: dict):
+    """Render the routing summary returned by route_input_files()."""
+    parts = []
+    if routing["ingest"]:
+        parts.append(f"**{len(routing['ingest'])}** ingest-type file(s) staying in input/")
+    if routing["enrich_moved"]:
+        parts.append(f"**{len(routing['enrich_moved'])}** enrichment file(s) routed to pending/")
+    if routing["unparseable"]:
+        parts.append(f"**{len(routing['unparseable'])}** unparseable filename(s)")
+    if parts:
+        st.info(" · ".join(parts))
+
+    if routing["enrich_moved"]:
+        with st.expander(f"Enrichment files routed to pending/ ({len(routing['enrich_moved'])})"):
+            for fname in routing["enrich_moved"]:
+                st.write(f"  - `{fname}`")
+    if routing["ingest"]:
+        with st.expander(f"Ingest-type files in input/ ({len(routing['ingest'])})"):
+            for fname in routing["ingest"]:
+                st.write(f"  - `{fname}`")
+    if routing["unparseable"]:
+        st.error("These files don't match the naming pattern:")
+        for fname in routing["unparseable"]:
+            st.write(f"  - `{fname}`")
+
+
+def _continuity_prompt(conn, unknown: list[tuple[str, str]]):
+    """Render the account-continuity prompt for unknown prefixes.
+
+    Each unknown prefix is shown with options:
+      - Brand-new account: pick account_type + nickname
+      - Replacement for an existing prefix: pick which one to link
+
+    On save, source_file_map gets a new entry (and replaced_by_prefix link
+    if applicable). After all unknowns are resolved, scan + route re-runs.
+    """
+    st.warning(
+        f"**{len(unknown)} new account prefix(es) detected.** "
+        "Each one is either a brand-new account or a replacement for an existing account."
+    )
+
+    existing_sources = queries.get_active_sources(conn)
+    existing_prefixes = [r["source_prefix"] for r in existing_sources]
+    enricher_types = sorted(enricher_account_types())
+    all_types = ["checking", "credit_card"] + enricher_types
+
+    for fname, prefix in unknown:
+        st.markdown(f"### `{prefix}` (first seen in `{fname}`)")
+        with st.form(f"continuity_{prefix}"):
+            mode = st.radio(
+                "What is this account?",
+                ["Brand-new account", "Replacement for an existing account"],
+                key=f"mode_{prefix}", horizontal=True,
+            )
+            acct_type = st.selectbox(
+                "Account type", all_types, key=f"acct_{prefix}",
+                help=(
+                    "checking / credit_card: file goes through normal ingest "
+                    "and needs a column template. "
+                    "venmo_detail / amazon_detail: file is an enrichment file."
+                ),
+            )
+            nickname = st.text_input("Nickname (optional)", key=f"nick_{prefix}")
+            replaced = None
+            if mode.startswith("Replacement"):
+                replaced = st.selectbox(
+                    "Which existing prefix does this replace?",
+                    existing_prefixes, key=f"replaces_{prefix}",
+                )
+            saved = st.form_submit_button("Save")
+            if saved:
+                queries.upsert_source_file_map(
+                    conn, prefix, prefix, nickname or None, acct_type
+                )
+                if replaced:
+                    queries.set_replaced_by_prefix(conn, replaced, prefix)
+                st.success(f"Saved `{prefix}` as `{acct_type}`")
+                # Drop this prefix from the unknown list
+                st.session_state.unknown_prefixes = [
+                    (f, p) for (f, p) in st.session_state.unknown_prefixes
+                    if p != prefix
+                ]
+                # If all resolved, kick off a re-scan
+                if not st.session_state.unknown_prefixes:
+                    st.session_state.pop("unknown_prefixes", None)
+                    _scan_and_route(conn)
+                st.rerun()
+
+
+def _missing_source_prompt(conn, missing: list[dict]):
+    """Render the 4-option prompt for sources that were present last period
+    but absent from the current input.
+    """
+    st.error(
+        f"**{len(missing)} known account(s) appear to be missing from this input batch.**"
+    )
+
+    existing_sources = queries.get_active_sources(conn)
+    existing_prefixes = [r["source_prefix"] for r in existing_sources]
+
+    for entry in missing:
+        prefix = entry["prefix"]
+        nick = entry["nickname"] or ""
+        st.markdown(f"### `{prefix}` ({nick}) — last seen through {entry['last_seen']}")
+        with st.form(f"missing_{prefix}"):
+            choice = st.radio(
+                "How do you want to handle this?",
+                [
+                    "Continue anyway (just remind me later)",
+                    "Stop processing so I can add the missing data",
+                    "This account has been discontinued",
+                    "This account has been replaced by a new account",
+                ],
+                key=f"missing_choice_{prefix}",
+            )
+            replacement = None
+            if choice.startswith("This account has been replaced"):
+                replacement = st.text_input(
+                    "New account prefix (e.g. Chase12345)",
+                    key=f"missing_repl_{prefix}",
+                )
+            submitted = st.form_submit_button("Confirm")
+            if submitted:
+                if choice.startswith("Continue"):
+                    pass
+                elif choice.startswith("Stop"):
+                    st.warning("Processing stopped. Re-run after adding the missing file.")
+                    st.session_state.missing_sources = []
+                    return
+                elif choice.startswith("This account has been discontinued"):
+                    queries.mark_account_discontinued(conn, prefix)
+                elif choice.startswith("This account has been replaced"):
+                    if replacement and replacement.strip():
+                        repl = replacement.strip()
+                        # Create the replacement if it doesn't exist yet
+                        if queries.get_source_row(conn, repl) is None:
+                            queries.upsert_source_file_map(
+                                conn, repl, repl, None, None
+                            )
+                        queries.set_replaced_by_prefix(conn, prefix, repl)
+                # Drop this prefix from missing list
+                st.session_state.missing_sources = [
+                    m for m in st.session_state.missing_sources
+                    if m["prefix"] != prefix
+                ]
+                if not st.session_state.missing_sources:
+                    st.session_state.missing_sources = []
+                st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -400,3 +642,143 @@ def _setup_card_subsources(conn, filepath, prefix, card_col, account_type=None):
         if not queries.get_source_label(conn, sub_prefix):
             queries.upsert_source_file_map(conn, sub_prefix, sub_prefix, f"{prefix} Card {card_val}", account_type)
             st.info(f"Created source: {sub_prefix} → {prefix} Card {card_val}")
+
+
+# ---------------------------------------------------------------------------
+# Enrichment section (always visible at the bottom of the Ingest page)
+# ---------------------------------------------------------------------------
+
+def _enrichment_section(conn):
+    """Render the pending/-folder summary and the enrichment preview + apply."""
+    st.header("Enrichment")
+    st.caption(
+        "Files in `pending/` add detail to Chase rows (e.g. who you sent a "
+        "Venmo to, or what was in an Amazon order). They never create new "
+        "transactions. Files that don't fully match this period stay in "
+        "pending and retry next period automatically."
+    )
+
+    PENDING_DIR.mkdir(exist_ok=True)
+    statuses = list_pending_status(conn)
+    if not statuses:
+        st.info("No files in pending/. Drop Venmo or Amazon CSV files in input/ "
+                "and click **Check Input Files** above.")
+        return
+
+    # Pending folder status banner
+    oldest_age = max(s["age_days"] for s in statuses)
+    st.warning(
+        f"**{len(statuses)} file(s)** in pending/ "
+        f"(oldest covers period ending {oldest_age} days ago)."
+    )
+
+    # Build the preview by parsing every pending file and matching.
+    if st.button("Preview Enrichment Matches", key="enrich_preview"):
+        summaries = scan_pending(conn)
+        st.session_state.enrich_summaries = summaries
+
+    summaries = st.session_state.get("enrich_summaries")
+    if summaries is None:
+        # Show a brief table of what's in pending so the user knows what's there.
+        df = pd.DataFrame(statuses)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        return
+
+    _show_enrichment_preview(conn, summaries)
+
+
+def _show_enrichment_preview(conn, summaries):
+    """Render the preview for every file in pending/ + the Apply button."""
+    if not summaries:
+        st.info("No enrichment files to preview.")
+        return
+
+    total_matched = sum(len(s.matched) for s in summaries)
+    total_unmatched_expected = sum(len(s.unmatched_expected) for s in summaries)
+    total_unmatched_unexpected = sum(len(s.unmatched_unexpected) for s in summaries)
+
+    summary_parts = [
+        f"**{total_matched}** match(es)",
+        f"**{total_unmatched_expected}** unmatched (will retry next period)",
+    ]
+    if total_unmatched_unexpected:
+        summary_parts.append(f"**{total_unmatched_unexpected}** no-match-expected (informational)")
+    st.write(" · ".join(summary_parts))
+
+    for summary in summaries:
+        fname = summary.filepath.name
+        n_match = len(summary.matched)
+        n_unmatched = len(summary.unmatched_expected)
+        n_skip_ok = len(summary.unmatched_unexpected)
+        status_icon = "✅" if summary.fully_resolved else "⏳"
+        with st.expander(
+            f"{status_icon} {fname} — {n_match} match · {n_unmatched} pending · {n_skip_ok} expected-no-match",
+            expanded=not summary.fully_resolved,
+        ):
+            _render_summary_table(summary)
+
+    col1, col2 = st.columns(2)
+    if col1.button("Apply Enrichments", type="primary", key="enrich_apply"):
+        result = commit_pending(conn, summaries)
+        st.session_state.pop("enrich_summaries", None)
+        msg = (
+            f"Applied **{result['applied']}** patch(es). "
+            f"Skipped **{result['skipped']}** already-overridden row(s). "
+            f"Moved **{len(result['moved_to_processed'])}** file(s) to processed/; "
+            f"**{len(result['kept_in_pending'])}** file(s) remain in pending/."
+        )
+        st.success(msg)
+        st.rerun()
+
+    if col2.button("Cancel", key="enrich_cancel"):
+        st.session_state.pop("enrich_summaries", None)
+        st.rerun()
+
+
+def _render_summary_table(summary):
+    """One file's match details: matched, unmatched (expected), no-match-expected."""
+    rows_matched = []
+    for prop in summary.matched:
+        txn = prop.txn_row
+        rec = prop.record
+        rows_matched.append({
+            "Chase Date": txn["date"] if txn else "",
+            "Chase Description": (txn["description_raw"] if txn else "")[:60],
+            "Amount": float(txn["amount"]) if txn else None,
+            "→ Payee": rec.payee_hint or "",
+            "→ Via": rec.via_hint or "",
+            "→ Note": (rec.note_hint or "")[:60],
+            "Reason": prop.reason,
+        })
+    if rows_matched:
+        st.markdown("**Matched (will be applied):**")
+        st.dataframe(pd.DataFrame(rows_matched), use_container_width=True,
+                     hide_index=True, height=min(35 * (len(rows_matched) + 1) + 3, 300))
+
+    rows_unmatched = []
+    for prop in summary.unmatched_expected:
+        rec = prop.record
+        rows_unmatched.append({
+            "Record Date": rec.match_key.get("date", ""),
+            "Amount": rec.match_key.get("amount", ""),
+            "Hint Payee": rec.payee_hint or "",
+            "Reason": prop.reason,
+        })
+    if rows_unmatched:
+        st.markdown("**Unmatched (file stays in pending for next period):**")
+        st.dataframe(pd.DataFrame(rows_unmatched), use_container_width=True,
+                     hide_index=True, height=min(35 * (len(rows_unmatched) + 1) + 3, 250))
+
+    rows_info = []
+    for prop in summary.unmatched_unexpected:
+        rec = prop.record
+        rows_info.append({
+            "Record Date": rec.match_key.get("date", "") if rec.match_key else "",
+            "Amount": rec.match_key.get("amount", "") if rec.match_key else "",
+            "Hint Payee": rec.payee_hint or "",
+            "Reason": prop.reason,
+        })
+    if rows_info:
+        st.markdown("**No Chase match expected (informational only):**")
+        st.dataframe(pd.DataFrame(rows_info), use_container_width=True,
+                     hide_index=True, height=min(35 * (len(rows_info) + 1) + 3, 200))

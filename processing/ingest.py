@@ -8,6 +8,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from db import queries
+from processing.placeholders import default_category_for
 
 INPUT_DIR = Path(__file__).resolve().parent.parent / "input"
 PROCESSED_DIR = Path(__file__).resolve().parent.parent / "processed"
@@ -60,6 +61,7 @@ class FileValidationResult:
         self.parsed: dict | None = None      # output of parse_filename
         self.template: sqlite3.Row | None = None
         self.needs_template: bool = False
+        self.is_enrichment: bool = False
         self.file_hash: str | None = None
 
     @property
@@ -114,6 +116,16 @@ def _validate_one(conn: sqlite3.Connection, filepath: Path,
 
     # 4. Prefix lookup
     prefix = parsed["prefix"]
+    acct_type = queries.get_account_type(conn, prefix)
+
+    # Enrichment-type sources are handled by processing/enrich.py — they
+    # don't need a column template. If this file's prefix is a known enricher,
+    # mark it so callers can route it to pending/ instead of ingesting.
+    from processing.enrich import is_enricher_kind
+    if is_enricher_kind(acct_type):
+        result.is_enrichment = True
+        return result
+
     template = queries.get_column_template(conn, prefix)
     if template is None:
         result.needs_template = True
@@ -153,12 +165,7 @@ def _check_continuity(conn, result, parsed, prefix, template):
                 f"Gap detected for {source}: last transaction {latest_date}, "
                 f"file starts {file_start} ({gap_days - 1} day gap)"
             )
-        elif gap_days < 0:
-            overlap_end = min(latest_date, parsed["end_date"])
-            result.warnings.append(
-                f"Overlap detected for {source}: existing data through {latest_date}, "
-                f"file starts {file_start} (overlap through {overlap_end})"
-            )
+        # Overlaps are silently ignored — row-level dedup catches any duplicates.
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +258,11 @@ def parse_file_with_template(filepath: Path, template: sqlite3.Row,
         # Extract order/reference code from description
         order_ref = _extract_order_ref(desc_raw)
 
+        # Apply default category for rows that match a placeholder pattern
+        # (e.g. Venmo Payment → Cash, Amazon.com → Shopping). These defaults
+        # may be overwritten later when enrichment files arrive.
+        default_cat = default_category_for(desc_raw)
+
         transactions.append({
             "date": dt.isoformat(),
             "amount": str(amount),
@@ -258,11 +270,11 @@ def parse_file_with_template(filepath: Path, template: sqlite3.Row,
             "description_raw": desc_raw,
             "category_raw": cat_raw,
             "payee": None,
-            "via": None,
+            "via": default_cat["via"] if default_cat else None,
             "payor": None,
-            "category": None,
-            "subcategory": None,
-            "tax_flags": None,
+            "category": default_cat["category"] if default_cat else None,
+            "subcategory": default_cat["subcategory"] if default_cat else None,
+            "tax_flags": default_cat["tax_flags"] if default_cat else None,
             "note": None,
             "order_ref": order_ref,
             "source": source_label,
@@ -273,7 +285,10 @@ def parse_file_with_template(filepath: Path, template: sqlite3.Row,
     return transactions
 
 
-# Patterns that contain an order/reference code after * or #
+# Patterns that contain an order/reference code after * or #.
+# Note: most use \w+ for the captured ID (alphanumeric + underscore). eBay uses
+# hyphenated order IDs (e.g. "15-14492-24341") so its character class includes
+# the hyphen.
 _ORDER_REF_PATTERNS = [
     re.compile(r"Amazon\.com\*(\w+)", re.IGNORECASE),
     re.compile(r"AMAZON MKTPL\*(\w+)", re.IGNORECASE),
@@ -288,6 +303,7 @@ _ORDER_REF_PATTERNS = [
     re.compile(r"ONEQUINCE\*\s*(\w+)", re.IGNORECASE),
     re.compile(r"GiftHealth\*(\w+)", re.IGNORECASE),
     re.compile(r"FANDANGO\s+\*(\w+)", re.IGNORECASE),
+    re.compile(r"eBay\s+O\*([\w-]+)", re.IGNORECASE),
 ]
 
 
@@ -336,30 +352,29 @@ def _parse_amount(row: dict, template: sqlite3.Row) -> Decimal | None:
 # ---------------------------------------------------------------------------
 
 def ingest_file(conn: sqlite3.Connection, filepath: Path,
-                template: sqlite3.Row) -> list[dict]:
-    """Parse a file and insert transactions. Returns the inserted rows.
+                template: sqlite3.Row) -> tuple[list[dict], int]:
+    """Parse a file and insert transactions. Returns (inserted_rows, skipped_count).
 
-    Also checks for row-level duplicates and records the file as processed.
-    Raises ValueError if duplicates are found.
+    Row-level duplicates are silently skipped — overlapping date ranges across
+    consecutive files are expected, and the (date+source+amount+description_raw)
+    tuple uniquely identifies a transaction. The skipped count is surfaced so
+    the UI can display "ingested N, skipped M as duplicates."
     """
     transactions = parse_file_with_template(filepath, template, conn)
     parsed_info = parse_filename(filepath.name)
 
-    # Row-level duplicate check
-    duplicates = []
+    # Row-level duplicate filter (silent)
+    fresh = []
+    skipped = 0
     for txn in transactions:
         if queries.check_duplicate_rows(conn, txn["date"], txn["source"],
                                          txn["amount"], txn["description_raw"]):
-            duplicates.append(txn)
+            skipped += 1
+        else:
+            fresh.append(txn)
 
-    if duplicates:
-        raise ValueError(
-            f"Found {len(duplicates)} duplicate transaction(s) in {filepath.name}. "
-            f"Resolve before proceeding."
-        )
-
-    # Insert all transactions in one batch
-    queries.insert_transactions(conn, transactions)
+    # Insert remaining (non-duplicate) transactions in one batch
+    queries.insert_transactions(conn, fresh)
 
     # Record the processed file
     file_hash = queries.compute_file_hash(filepath)
@@ -374,6 +389,47 @@ def ingest_file(conn: sqlite3.Connection, filepath: Path,
 
     # Move file to processed/
     PROCESSED_DIR.mkdir(exist_ok=True)
-    filepath.rename(PROCESSED_DIR / filepath.name)
+    dest = PROCESSED_DIR / filepath.name
+    if dest.exists():
+        dest.unlink()
+    filepath.rename(dest)
 
-    return transactions
+    return fresh, skipped
+
+
+# ---------------------------------------------------------------------------
+# Cross-source completeness check
+# ---------------------------------------------------------------------------
+
+def check_cross_source_completeness(conn: sqlite3.Connection,
+                                     current_prefixes: set[str]) -> list[dict]:
+    """Return a list of sources that were present in prior periods but absent
+    from the current input set. Used to warn the user about a missing account
+    before processing proceeds.
+
+    Each dict has: prefix, last_seen (date_range_end string), nickname,
+    replaced_by_prefix (if linked), discontinued_since (if marked).
+    Discontinued accounts are filtered out — they're expected to be absent.
+    """
+    history = queries.get_sources_seen_in_history(conn)
+    missing = []
+    for prefix, last_end in history.items():
+        if prefix in current_prefixes:
+            continue
+        src_row = queries.get_source_row(conn, prefix)
+        if not src_row:
+            continue
+        # Skip discontinued accounts and accounts that have a replacement
+        # already showing up in the current input.
+        if src_row["discontinued_since"]:
+            continue
+        if src_row["replaced_by_prefix"] and src_row["replaced_by_prefix"] in current_prefixes:
+            continue
+        missing.append({
+            "prefix": prefix,
+            "last_seen": last_end,
+            "nickname": src_row["nickname"],
+            "replaced_by_prefix": src_row["replaced_by_prefix"],
+            "discontinued_since": src_row["discontinued_since"],
+        })
+    return missing

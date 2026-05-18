@@ -5,7 +5,10 @@ import streamlit as st
 from datetime import date
 
 from db import queries
-from processing.reports import generate_monthly_pdf, generate_excel_export, OUTPUT_DIR
+from processing.reports import (
+    generate_monthly_pdf, generate_excel_export, OUTPUT_DIR,
+    MODE_CHOICES, MODE_LABELS, MODE_FINALIZED, MODE_DRAFT, MODE_ALL,
+)
 
 
 def _get_date_range(conn):
@@ -21,6 +24,40 @@ def _get_date_range(conn):
     if st.session_state.get("period_start") and st.session_state.get("period_end"):
         return st.session_state["period_start"], st.session_state["period_end"]
     return date.today().replace(day=1), date.today()
+
+
+def _scope_selector(key: str) -> str:
+    """Render the report-scope selectbox. Returns the mode constant."""
+    label = st.selectbox(
+        "Scope",
+        MODE_CHOICES,
+        format_func=lambda m: MODE_LABELS[m],
+        index=MODE_CHOICES.index(MODE_FINALIZED),
+        key=key,
+        help=(
+            "Finalized only: status='confirmed' rows (used for tax filings, "
+            "final reports). Draft only: status in {'pending','needs_review'} "
+            "(used to see what's outstanding). All transactions: everything "
+            "in the period regardless of status."
+        ),
+    )
+    return label
+
+
+def _count_in_scope(conn, start_str: str, end_str: str, mode: str) -> int:
+    """Count rows in range that match the mode filter."""
+    if mode == MODE_FINALIZED:
+        sc = "status = 'confirmed'"
+    elif mode == MODE_DRAFT:
+        sc = "status IN ('pending', 'needs_review')"
+    else:
+        sc = "1=1"
+    row = conn.execute(
+        f"SELECT COUNT(*) as cnt FROM transactions "
+        f"WHERE date >= ? AND date <= ? AND {sc}",
+        (start_str, end_str),
+    ).fetchone()
+    return row["cnt"]
 
 
 def reports_page(conn):
@@ -81,30 +118,18 @@ def _monthly_report(conn):
     month_start_str = month_start.isoformat()
     month_end_str = month_end.isoformat()
 
-    # Show transaction count
-    month_count = conn.execute(
-        "SELECT COUNT(*) as cnt FROM transactions WHERE date >= ? AND date <= ? AND status = 'confirmed'",
-        (month_start_str, month_end_str),
-    ).fetchone()["cnt"]
+    # Scope selector
+    mode = _scope_selector("rpt_mode")
 
+    # Transaction count for chosen scope
+    month_count = _count_in_scope(conn, month_start_str, month_end_str, mode)
     ytd_start_str = f"{selected_year}-01-01"
-    ytd_count = conn.execute(
-        "SELECT COUNT(*) as cnt FROM transactions WHERE date >= ? AND date <= ? AND status = 'confirmed'",
-        (ytd_start_str, month_end_str),
-    ).fetchone()["cnt"]
+    ytd_count = _count_in_scope(conn, ytd_start_str, month_end_str, mode)
 
     st.info(
-        f"**{calendar.month_name[selected_month]} {selected_year}**: "
-        f"{month_count} confirmed transaction(s) for the month, "
-        f"{ytd_count} YTD"
+        f"**{calendar.month_name[selected_month]} {selected_year}** ({MODE_LABELS[mode]}): "
+        f"{month_count} transaction(s) for the month, {ytd_count} YTD."
     )
-
-    pending = conn.execute(
-        "SELECT COUNT(*) as cnt FROM transactions WHERE date >= ? AND date <= ? AND status != 'confirmed'",
-        (month_start_str, month_end_str),
-    ).fetchone()["cnt"]
-    if pending > 0:
-        st.warning(f"{pending} transaction(s) in this month are not yet confirmed.")
 
     st.markdown("**Select sections to include:**")
     do_cat = st.checkbox("Category Summary (Month & YTD)", value=True, key="rpt_cat")
@@ -114,7 +139,7 @@ def _monthly_report(conn):
 
     if st.button("Generate Monthly Report", type="primary", key="gen_monthly"):
         if month_count == 0:
-            st.warning("No confirmed transactions for this month. Nothing to report.")
+            st.warning(f"No transactions in scope ({MODE_LABELS[mode]}) for this month. Nothing to report.")
             return
 
         sections = []
@@ -134,7 +159,7 @@ def _monthly_report(conn):
         try:
             title = f"Monthly Report - {calendar.month_name[selected_month]} {selected_year}"
             path = generate_monthly_pdf(conn, month_start_str, month_end_str,
-                                        title=title, sections=sections)
+                                        title=title, sections=sections, mode=mode)
             st.success(f"Report generated: `{path}`")
         except Exception as e:
             st.error(f"Report generation failed: {e}")
@@ -157,19 +182,17 @@ def _adhoc_reports(conn):
     start_str = start.isoformat()
     end_str = end.isoformat()
 
-    txn_count = conn.execute(
-        "SELECT COUNT(*) as cnt FROM transactions WHERE date >= ? AND date <= ? AND status = 'confirmed'",
-        (start_str, end_str),
-    ).fetchone()["cnt"]
-    st.caption(f"{txn_count} confirmed transaction(s) in selected range")
+    mode = _scope_selector("adhoc_mode")
+    txn_count = _count_in_scope(conn, start_str, end_str, mode)
+    st.caption(f"{txn_count} transaction(s) in scope ({MODE_LABELS[mode]})")
 
     if st.button("Generate", key="adhoc_gen"):
         if txn_count == 0:
-            st.warning("No confirmed transactions in the selected date range.")
+            st.warning(f"No transactions in scope ({MODE_LABELS[mode]}) in the selected range.")
             return
         try:
             title = f"Ad-Hoc Report -{start_str} to {end_str}"
-            path = generate_monthly_pdf(conn, start_str, end_str, title=title)
+            path = generate_monthly_pdf(conn, start_str, end_str, title=title, mode=mode)
             st.success(f"Report generated: `{path}`")
         except Exception as e:
             st.error(f"Report generation failed: {e}")
@@ -191,18 +214,16 @@ def _excel_export(conn):
     start_str = start.isoformat()
     end_str = end.isoformat()
 
-    txn_count = conn.execute(
-        "SELECT COUNT(*) as cnt FROM transactions WHERE date >= ? AND date <= ?",
-        (start_str, end_str),
-    ).fetchone()["cnt"]
-    st.caption(f"{txn_count} transaction(s) in selected range")
+    mode = _scope_selector("excel_mode")
+    txn_count = _count_in_scope(conn, start_str, end_str, mode)
+    st.caption(f"{txn_count} transaction(s) in scope ({MODE_LABELS[mode]})")
 
     if st.button("Export", key="excel_gen"):
         if txn_count == 0:
-            st.warning("No transactions in the selected date range.")
+            st.warning(f"No transactions in scope ({MODE_LABELS[mode]}) in the selected range.")
             return
         try:
-            path = generate_excel_export(conn, start_str, end_str)
+            path = generate_excel_export(conn, start_str, end_str, mode=mode)
             st.success(f"Exported: `{path}`")
         except Exception as e:
             st.error(f"Export failed: {e}")

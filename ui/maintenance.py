@@ -2,6 +2,7 @@
 
 import streamlit as st
 import pandas as pd
+from datetime import date
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 
 from db import queries
@@ -11,24 +12,27 @@ from db.schema import DB_PATH
 def maintenance_page(conn):
     st.title("Maintenance")
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tabs = st.tabs([
         "Source Accounts", "Payee Normalization", "Payee Metadata",
-        "Category Master", "Rename / Merge Payees", "Edit Transactions", "Database",
+        "Category Master", "Rename / Merge Payees", "Edit Transactions",
+        "Pending Folder", "Database",
     ])
 
-    with tab1:
+    with tabs[0]:
         _source_accounts(conn)
-    with tab2:
+    with tabs[1]:
         _payee_normalization(conn)
-    with tab3:
+    with tabs[2]:
         _payee_metadata(conn)
-    with tab4:
+    with tabs[3]:
         _category_master(conn)
-    with tab5:
+    with tabs[4]:
         _rename_merge_payees(conn)
-    with tab6:
+    with tabs[5]:
         _edit_transactions(conn)
-    with tab7:
+    with tabs[6]:
+        _pending_folder(conn)
+    with tabs[7]:
         _database_admin(conn)
 
 
@@ -38,6 +42,12 @@ def maintenance_page(conn):
 
 def _source_accounts(conn):
     st.subheader("Source Accounts")
+    st.caption(
+        "Account types: `checking`/`credit_card` use the column-template ingest "
+        "path; `venmo_detail`/`amazon_detail` route to enrichment. "
+        "Use `replaced_by_prefix` to link a reissued account to its successor, "
+        "and `discontinued_since` to silence missing-account warnings."
+    )
 
     rows = queries.get_source_file_map(conn)
     if not rows:
@@ -45,24 +55,40 @@ def _source_accounts(conn):
         return
 
     df = pd.DataFrame([dict(r) for r in rows])
+    # Ensure all expected columns exist even on partially-migrated DBs
+    for col in ("discontinued_since", "replaced_by_prefix"):
+        if col not in df.columns:
+            df[col] = None
+    df["discontinued_since"] = df["discontinued_since"].fillna("")
+    df["replaced_by_prefix"] = df["replaced_by_prefix"].fillna("")
+    df["nickname"] = df["nickname"].fillna("")
+    df["account_type"] = df["account_type"].fillna("")
 
-    gb = GridOptionsBuilder.from_dataframe(df[["id", "source_prefix", "source_label", "nickname", "account_type"]])
+    display_cols = ["id", "source_prefix", "source_label", "nickname",
+                    "account_type", "replaced_by_prefix", "discontinued_since"]
+
+    from processing.enrich import enricher_account_types
+    type_choices = sorted({"checking", "credit_card"} | enricher_account_types())
+
+    gb = GridOptionsBuilder.from_dataframe(df[display_cols])
     gb.configure_default_column(resizable=True, sortable=True, editable=False)
     gb.configure_grid_options(singleClickEdit=True, stopEditingWhenCellsLoseFocus=True)
     gb.configure_column("id", width=50)
     gb.configure_column("source_prefix", width=130)
     gb.configure_column("source_label", width=130)
-    gb.configure_column("nickname", editable=True, width=200)
-    gb.configure_column("account_type", editable=True, width=120,
+    gb.configure_column("nickname", editable=True, width=180)
+    gb.configure_column("account_type", editable=True, width=130,
                         cellEditor="agSelectCellEditor",
-                        cellEditorParams={"values": ["checking", "credit_card"]})
+                        cellEditorParams={"values": type_choices})
+    gb.configure_column("replaced_by_prefix", editable=True, width=150)
+    gb.configure_column("discontinued_since", editable=True, width=140)
 
     grid_response = AgGrid(
-        df[["id", "source_prefix", "source_label", "nickname", "account_type"]],
+        df[display_cols],
         gridOptions=gb.build(),
         update_mode=GridUpdateMode.VALUE_CHANGED,
         fit_columns_on_grid_load=True,
-        height=300,
+        height=350,
     )
 
     if st.button("Save Changes", key="save_sources"):
@@ -70,8 +96,20 @@ def _source_accounts(conn):
         for _, row in edited.iterrows():
             queries.upsert_source_file_map(
                 conn, row["source_prefix"], row["source_label"],
-                row["nickname"] or None, row["account_type"],
+                row["nickname"] or None, row["account_type"] or None,
             )
+            # Update continuity columns directly (upsert_source_file_map
+            # doesn't touch them)
+            conn.execute(
+                "UPDATE source_file_map SET replaced_by_prefix = ?, "
+                "discontinued_since = ? WHERE source_prefix = ?",
+                (
+                    (row["replaced_by_prefix"] or None),
+                    (row["discontinued_since"] or None),
+                    row["source_prefix"],
+                ),
+            )
+        conn.commit()
         st.success("Saved.")
         st.rerun()
 
@@ -579,6 +617,51 @@ def _edit_transactions(conn):
 
 
 # ---------------------------------------------------------------------------
+# Pending Folder
+# ---------------------------------------------------------------------------
+
+def _pending_folder(conn):
+    st.subheader("Pending Folder")
+    st.caption(
+        "Enrichment files (Venmo, Amazon, ...) sit here until every record "
+        "they contain has matched a Chase row. Files automatically retry on "
+        "each Ingest run. Use the cleanup tool below to archive stale files "
+        "manually — nothing moves automatically."
+    )
+
+    from processing.enrich import list_pending_status, cleanup_pending
+
+    statuses = list_pending_status(conn)
+    if not statuses:
+        st.info("Pending folder is empty.")
+        return
+
+    df = pd.DataFrame(statuses)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("**Cleanup:** move pending files older than the threshold "
+                "into `processed/` (they'll no longer be retried).")
+    col1, col2 = st.columns([1, 3])
+    threshold_days = col1.number_input(
+        "Older than (days)",
+        min_value=30, max_value=3650, value=180, step=30,
+        key="pending_cleanup_days",
+    )
+    col2.caption(f"Default 180 days. Today: {date.today().isoformat()}.")
+
+    if st.button("Move stale files to processed/", key="pending_cleanup"):
+        moved = cleanup_pending(conn, int(threshold_days))
+        if moved:
+            st.success(f"Moved {len(moved)} file(s) to processed/:")
+            for fname in moved:
+                st.write(f"  - `{fname}`")
+        else:
+            st.info(f"No files older than {threshold_days} days.")
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # Database Admin
 # ---------------------------------------------------------------------------
 
@@ -596,6 +679,42 @@ def _database_admin(conn):
         [{"Table": k, "Rows": v} for k, v in counts.items()]
     )
     st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Reset historical Venmo rows for enrichment")
+    st.caption(
+        "Migrates existing Chase Venmo rows from the old placeholder convention "
+        "to the new design so enrichment can patch them: clears `overridden`, "
+        "resets `category` to the default Cash → Deposited or Withdrawn, and "
+        "moves them back to `pending` status. Only touches rows that have no "
+        "user-customized data (no note, no payor, no tax flags). Safe to run "
+        "more than once."
+    )
+    candidates = conn.execute(
+        "SELECT COUNT(*) AS cnt FROM transactions "
+        "WHERE via = 'Venmo' AND payee IS NULL "
+        "AND note IS NULL AND payor IS NULL AND tax_flags IS NULL "
+        "AND (overridden = 1 OR status != 'pending' OR category != 'Cash')"
+    ).fetchone()["cnt"]
+    if candidates:
+        st.write(f"**{candidates}** historical Venmo row(s) eligible for reset.")
+        if st.button("Reset eligible Venmo rows", key="reset_venmo"):
+            cur = conn.execute(
+                "UPDATE transactions "
+                "SET overridden = 0, "
+                "    category = 'Cash', "
+                "    subcategory = 'Deposited or Withdrawn', "
+                "    tax_flags = NULL, "
+                "    status = 'pending' "
+                "WHERE via = 'Venmo' AND payee IS NULL "
+                "AND note IS NULL AND payor IS NULL AND tax_flags IS NULL "
+                "AND (overridden = 1 OR status != 'pending' OR category != 'Cash')"
+            )
+            conn.commit()
+            st.success(f"Reset {cur.rowcount} row(s). Drop the Venmo file in input/ to enrich them.")
+            st.rerun()
+    else:
+        st.info("No historical Venmo rows need reset.")
 
     st.divider()
     st.subheader("Purge Transaction Data")

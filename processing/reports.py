@@ -15,21 +15,83 @@ OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 
 
 # ---------------------------------------------------------------------------
+# Report modes
+# ---------------------------------------------------------------------------
+# Picked at report-run time. Controls which rows appear in the report body
+# (the top banner always reflects the chosen scope so it's never ambiguous
+# what was included).
+
+MODE_FINALIZED = "finalized"
+MODE_DRAFT = "draft"
+MODE_ALL = "all"
+
+MODE_CHOICES = [MODE_FINALIZED, MODE_DRAFT, MODE_ALL]
+MODE_LABELS = {
+    MODE_FINALIZED: "Finalized only",
+    MODE_DRAFT: "Draft only",
+    MODE_ALL: "All transactions",
+}
+
+
+def _filter_by_mode(rows, mode: str) -> list:
+    """Filter a list of transaction rows by report mode."""
+    if mode == MODE_FINALIZED:
+        return [r for r in rows if r["status"] == "confirmed"]
+    if mode == MODE_DRAFT:
+        return [r for r in rows if r["status"] in ("pending", "needs_review")]
+    return list(rows)  # MODE_ALL
+
+
+# ---------------------------------------------------------------------------
 # Data gathering helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_month_transactions(conn: sqlite3.Connection, start: str, end: str) -> list[dict]:
-    """Fetch confirmed transactions for a date range."""
+def _fetch_month_transactions(conn: sqlite3.Connection, start: str, end: str,
+                               mode: str = MODE_FINALIZED) -> list[dict]:
+    """Fetch transactions for a date range, filtered by report mode."""
     rows = queries.get_transactions(conn, start_date=start, end_date=end)
-    return [dict(r) for r in rows if r["status"] == "confirmed"]
+    return [dict(r) for r in _filter_by_mode(rows, mode)]
 
 
-def _fetch_ytd_transactions(conn: sqlite3.Connection, end: str) -> list[dict]:
-    """Fetch confirmed transactions from Jan 1 of the end-date year through end."""
+def _fetch_ytd_transactions(conn: sqlite3.Connection, end: str,
+                             mode: str = MODE_FINALIZED) -> list[dict]:
+    """Fetch transactions from Jan 1 of the end-date year, filtered by mode."""
     year = end[:4]
     ytd_start = f"{year}-01-01"
     rows = queries.get_transactions(conn, start_date=ytd_start, end_date=end)
-    return [dict(r) for r in rows if r["status"] == "confirmed"]
+    return [dict(r) for r in _filter_by_mode(rows, mode)]
+
+
+def count_unfinalized(conn: sqlite3.Connection, start: str, end: str) -> tuple[int, Decimal]:
+    """Count + sum of non-finalized (pending or needs_review) rows in range."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total "
+        "FROM transactions WHERE date >= ? AND date <= ? "
+        "AND status IN ('pending', 'needs_review')",
+        (start, end),
+    ).fetchone()
+    return row["cnt"], Decimal(str(row["total"]))
+
+
+def count_missing_payee(conn: sqlite3.Connection, start: str, end: str,
+                          mode: str = MODE_FINALIZED) -> tuple[int, Decimal]:
+    """Count + sum of rows IN-SCOPE (mode-filtered) where payee IS NULL.
+
+    Used for the missing-payee warning banner on each report.
+    """
+    if mode == MODE_FINALIZED:
+        status_clause = "AND status = 'confirmed'"
+    elif mode == MODE_DRAFT:
+        status_clause = "AND status IN ('pending', 'needs_review')"
+    else:  # MODE_ALL
+        status_clause = ""
+    sql = (
+        f"SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total "
+        f"FROM transactions WHERE date >= ? AND date <= ? "
+        f"AND payee IS NULL {status_clause}"
+    )
+    row = conn.execute(sql, (start, end)).fetchone()
+    return row["cnt"], Decimal(str(row["total"]))
 
 
 def _sum_by(txns: list[dict], *keys) -> dict[tuple, Decimal]:
@@ -316,9 +378,17 @@ def _write_tax_items(pdf: AbacusPDF, month_txns, ytd_txns):
 
 def _write_checksums(pdf: AbacusPDF, conn, start, end,
                      month_txns, ytd_txns,
-                     month_no_xfer, ytd_no_xfer, month_xfer):
-    """Checksums page - cross-reference counts and totals for integrity."""
-    pdf.section_title("Checksums - Data Integrity Verification")
+                     month_no_xfer, ytd_no_xfer, month_xfer,
+                     mode: str = MODE_FINALIZED):
+    """Checksums section - cross-reference counts and totals for integrity.
+
+    The 'in-scope' total compares against the report's selected mode rather
+    than always against 'confirmed'. The MATCH check passes when the report
+    body's count and dollar total equal the DB total for the mode-filtered
+    rows in the period.
+    """
+    mode_label = MODE_LABELS.get(mode, mode)
+    pdf.section_title(f"Checksums - Data Integrity Verification ({mode_label})")
 
     year = end[:4]
     ytd_start = f"{year}-01-01"
@@ -336,29 +406,39 @@ def _write_checksums(pdf: AbacusPDF, conn, start, end,
         (ytd_start, end),
     ).fetchone()
 
-    # Database counts (confirmed only)
-    db_month_confirmed = conn.execute(
-        "SELECT COUNT(*) as cnt, COALESCE(SUM(amount), 0) as total "
-        "FROM transactions WHERE date >= ? AND date <= ? AND status = 'confirmed'",
+    # Database counts (in scope for the chosen mode)
+    if mode == MODE_FINALIZED:
+        scope_clause = "status = 'confirmed'"
+        out_of_scope_clause = "status IN ('pending', 'needs_review')"
+    elif mode == MODE_DRAFT:
+        scope_clause = "status IN ('pending', 'needs_review')"
+        out_of_scope_clause = "status = 'confirmed'"
+    else:  # MODE_ALL
+        scope_clause = "1=1"
+        out_of_scope_clause = "0=1"
+
+    db_month_in_scope = conn.execute(
+        f"SELECT COUNT(*) as cnt, COALESCE(SUM(amount), 0) as total "
+        f"FROM transactions WHERE date >= ? AND date <= ? AND {scope_clause}",
         (start, end),
     ).fetchone()
 
-    db_ytd_confirmed = conn.execute(
-        "SELECT COUNT(*) as cnt, COALESCE(SUM(amount), 0) as total "
-        "FROM transactions WHERE date >= ? AND date <= ? AND status = 'confirmed'",
+    db_ytd_in_scope = conn.execute(
+        f"SELECT COUNT(*) as cnt, COALESCE(SUM(amount), 0) as total "
+        f"FROM transactions WHERE date >= ? AND date <= ? AND {scope_clause}",
         (ytd_start, end),
     ).fetchone()
 
-    # Pending/needs_review in period
-    db_month_pending = conn.execute(
-        "SELECT COUNT(*) as cnt FROM transactions "
-        "WHERE date >= ? AND date <= ? AND status != 'confirmed'",
+    # Counts outside the chosen scope (just for reference)
+    db_month_out_of_scope = conn.execute(
+        f"SELECT COUNT(*) as cnt FROM transactions "
+        f"WHERE date >= ? AND date <= ? AND {out_of_scope_clause}",
         (start, end),
     ).fetchone()["cnt"]
 
-    db_ytd_pending = conn.execute(
-        "SELECT COUNT(*) as cnt FROM transactions "
-        "WHERE date >= ? AND date <= ? AND status != 'confirmed'",
+    db_ytd_out_of_scope = conn.execute(
+        f"SELECT COUNT(*) as cnt FROM transactions "
+        f"WHERE date >= ? AND date <= ? AND {out_of_scope_clause}",
         (ytd_start, end),
     ).fetchone()["cnt"]
 
@@ -388,16 +468,19 @@ def _write_checksums(pdf: AbacusPDF, conn, start, end,
     widths = [100, 25, 35]
     pdf.table_header(widths, ["Metric", "Count", "Amount"])
 
+    in_scope_label = f"Database in scope ({mode_label})"
+    out_of_scope_label = "Database out of scope" if mode != MODE_ALL else "(no out-of-scope rows)"
+
     pdf.group_header(f"Month: {start} to {end}", level=0)
     pdf.table_row(widths, ["Database total (all statuses)",
                            str(db_month_all["cnt"]),
                            _fmt_amt(db_month_all["total"])])
-    pdf.table_row(widths, ["Database confirmed",
-                           str(db_month_confirmed["cnt"]),
-                           _fmt_amt(db_month_confirmed["total"])])
-    pdf.table_row(widths, ["Database pending/needs_review",
-                           str(db_month_pending), ""])
-    pdf.table_row(widths, ["Report total (confirmed, incl transfers)",
+    pdf.table_row(widths, [in_scope_label,
+                           str(db_month_in_scope["cnt"]),
+                           _fmt_amt(db_month_in_scope["total"])])
+    pdf.table_row(widths, [out_of_scope_label,
+                           str(db_month_out_of_scope), ""])
+    pdf.table_row(widths, ["Report total (in scope, incl transfers)",
                            str(rpt_month_count),
                            _fmt_amt(rpt_month_total)])
     pdf.table_row(widths, ["Report excl transfers (used in summaries)",
@@ -408,8 +491,8 @@ def _write_checksums(pdf: AbacusPDF, conn, start, end,
                            _fmt_amt(rpt_xfer_total)])
 
     # Match check
-    month_match = (rpt_month_count == db_month_confirmed["cnt"] and
-                   Decimal(str(rpt_month_total)) == Decimal(str(db_month_confirmed["total"])))
+    month_match = (rpt_month_count == db_month_in_scope["cnt"] and
+                   Decimal(str(rpt_month_total)) == Decimal(str(db_month_in_scope["total"])))
     pdf.table_row(widths, [
         "MONTH MATCH" if month_match else "*** MONTH MISMATCH ***",
         "OK" if month_match else "FAIL", ""
@@ -420,20 +503,20 @@ def _write_checksums(pdf: AbacusPDF, conn, start, end,
     pdf.table_row(widths, ["Database total (all statuses)",
                            str(db_ytd_all["cnt"]),
                            _fmt_amt(db_ytd_all["total"])])
-    pdf.table_row(widths, ["Database confirmed",
-                           str(db_ytd_confirmed["cnt"]),
-                           _fmt_amt(db_ytd_confirmed["total"])])
-    pdf.table_row(widths, ["Database pending/needs_review",
-                           str(db_ytd_pending), ""])
-    pdf.table_row(widths, ["Report total (confirmed, incl transfers)",
+    pdf.table_row(widths, [in_scope_label,
+                           str(db_ytd_in_scope["cnt"]),
+                           _fmt_amt(db_ytd_in_scope["total"])])
+    pdf.table_row(widths, [out_of_scope_label,
+                           str(db_ytd_out_of_scope), ""])
+    pdf.table_row(widths, ["Report total (in scope, incl transfers)",
                            str(rpt_ytd_count),
                            _fmt_amt(rpt_ytd_total)])
     pdf.table_row(widths, ["Report excl transfers",
                            str(rpt_ytd_no_xfer_count),
                            _fmt_amt(rpt_ytd_no_xfer_total)])
 
-    ytd_match = (rpt_ytd_count == db_ytd_confirmed["cnt"] and
-                 Decimal(str(rpt_ytd_total)) == Decimal(str(db_ytd_confirmed["total"])))
+    ytd_match = (rpt_ytd_count == db_ytd_in_scope["cnt"] and
+                 Decimal(str(rpt_ytd_total)) == Decimal(str(db_ytd_in_scope["total"])))
     pdf.table_row(widths, [
         "YTD MATCH" if ytd_match else "*** YTD MISMATCH ***",
         "OK" if ytd_match else "FAIL", ""
@@ -453,21 +536,60 @@ def _write_checksums(pdf: AbacusPDF, conn, start, end,
 # Public report generators
 # ---------------------------------------------------------------------------
 
+def _write_top_banners(pdf: AbacusPDF, conn: sqlite3.Connection,
+                        start: str, end: str, mode: str):
+    """Top-of-report scope banner + missing-payee warning."""
+    nf_count, nf_total = count_unfinalized(conn, start, end)
+    mp_count, mp_total = count_missing_payee(conn, start, end, mode)
+
+    # Scope label
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(0, 6, f"Scope: {MODE_LABELS[mode]}",
+             new_x="LMARGIN", new_y="NEXT")
+
+    # Mode-specific inclusion/exclusion line
+    pdf.set_font("Helvetica", "", 9)
+    if mode == MODE_FINALIZED:
+        banner = (f"This report EXCLUDES {nf_count} transaction(s) totaling "
+                  f"{_fmt_amt(nf_total)} that are not finalized.")
+    elif mode == MODE_DRAFT:
+        banner = (f"This report INCLUDES ONLY draft transactions: {nf_count} "
+                  f"totaling {_fmt_amt(nf_total)} (not yet finalized).")
+    else:  # MODE_ALL
+        banner = (f"This report INCLUDES {nf_count} transaction(s) totaling "
+                  f"{_fmt_amt(nf_total)} that are not finalized.")
+    pdf.cell(0, 5, _safe(banner), new_x="LMARGIN", new_y="NEXT")
+
+    # Missing-payee warning (only if any in-scope rows have NULL payee)
+    if mp_count:
+        pdf.set_font("Helvetica", "BI", 9)
+        warning = (f"WARNING: This report includes {mp_count} transaction(s) "
+                   f"totaling {_fmt_amt(mp_total)} where the payee is missing.")
+        pdf.cell(0, 5, _safe(warning), new_x="LMARGIN", new_y="NEXT")
+
+    pdf.ln(3)
+
+
 def generate_monthly_pdf(conn: sqlite3.Connection, start: str, end: str,
                          title: str | None = None,
-                         sections: list[str] | None = None) -> Path:
+                         sections: list[str] | None = None,
+                         mode: str = MODE_FINALIZED) -> Path:
     """Generate the monthly PDF report.
 
     sections controls which sections to include. Options:
     'category_summary', 'payee_summary', 'transaction_detail', 'tax_items'
     If None, all sections are included.
+
+    mode: one of MODE_FINALIZED (default), MODE_DRAFT, or MODE_ALL.
+    Controls which transactions appear in the body. The top banner always
+    reflects the chosen mode.
     """
     OUTPUT_DIR.mkdir(exist_ok=True)
     if sections is None:
         sections = ["category_summary", "payee_summary", "transaction_detail", "tax_items"]
 
-    month_txns = _fetch_month_transactions(conn, start, end)
-    ytd_txns = _fetch_ytd_transactions(conn, end)
+    month_txns = _fetch_month_transactions(conn, start, end, mode=mode)
+    ytd_txns = _fetch_ytd_transactions(conn, end, mode=mode)
 
     # Separate transfers
     month_no_xfer = [t for t in month_txns if t.get("category") != "Transfer"]
@@ -478,14 +600,14 @@ def generate_monthly_pdf(conn: sqlite3.Connection, start: str, end: str,
     pdf = AbacusPDF(title=report_title)
     pdf.alias_nb_pages()
 
-    first_page = True
+    # Page 1: scope + missing-payee banners, then the checksum table.
+    pdf.add_page()
+    _write_top_banners(pdf, conn, start, end, mode)
+    _write_checksums(pdf, conn, start, end, month_txns, ytd_txns,
+                     month_no_xfer, ytd_no_xfer, month_xfer, mode=mode)
 
     if "category_summary" in sections:
-        if not first_page:
-            pdf.add_page()
-        else:
-            pdf.add_page()
-            first_page = False
+        pdf.add_page()
         _write_category_summary(pdf, month_no_xfer, ytd_no_xfer)
         if month_xfer:
             xfer_total = sum(Decimal(t["amount"]) for t in month_xfer)
@@ -495,23 +617,15 @@ def generate_monthly_pdf(conn: sqlite3.Connection, start: str, end: str,
 
     if "payee_summary" in sections:
         pdf.add_page()
-        first_page = False
         _write_payee_summary(pdf, month_no_xfer)
 
     if "transaction_detail" in sections:
         pdf.add_page()
-        first_page = False
         _write_transaction_detail(pdf, month_txns)
 
     if "tax_items" in sections:
         pdf.add_page()
-        first_page = False
         _write_tax_items(pdf, month_no_xfer, ytd_no_xfer)
-
-    # Always add checksums page
-    pdf.add_page()
-    _write_checksums(pdf, conn, start, end, month_txns, ytd_txns,
-                     month_no_xfer, ytd_no_xfer, month_xfer)
 
     filename = f"Monthly_Report_{start}_to_{end}.pdf"
     out_path = OUTPUT_DIR / filename
@@ -543,16 +657,21 @@ def generate_pending_items_pdf(conn: sqlite3.Connection) -> Path | None:
             t["source"], t["description_raw"], t["note"] or "",
         ])
 
-    out_path = OUTPUT_DIR / "Pending_Items.pdf"
+    # Timestamp the filename so re-runs don't collide with an open copy of the
+    # previous PDF (Windows locks files that any viewer has open).
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    out_path = OUTPUT_DIR / f"Pending_Items_{timestamp}.pdf"
     pdf.output(str(out_path))
     return out_path
 
 
-def generate_excel_export(conn: sqlite3.Connection, start: str, end: str) -> Path:
-    """Generate an Excel export of all transactions in a date range."""
+def generate_excel_export(conn: sqlite3.Connection, start: str, end: str,
+                          mode: str = MODE_FINALIZED) -> Path:
+    """Generate an Excel export of transactions in a date range, filtered by mode."""
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     rows = queries.get_transactions(conn, start_date=start, end_date=end)
+    rows = _filter_by_mode(rows, mode)
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -587,7 +706,8 @@ def generate_excel_export(conn: sqlite3.Connection, start: str, end: str) -> Pat
     for col_idx, h in enumerate(headers, 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = max(len(h) + 4, 12)
 
-    filename = f"Transactions_{start}_to_{end}.xlsx"
+    mode_suffix = {MODE_FINALIZED: "finalized", MODE_DRAFT: "draft", MODE_ALL: "all"}.get(mode, mode)
+    filename = f"Transactions_{start}_to_{end}_{mode_suffix}.xlsx"
     out_path = OUTPUT_DIR / filename
     wb.save(str(out_path))
     return out_path

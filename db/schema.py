@@ -53,11 +53,13 @@ CREATE TABLE IF NOT EXISTS categories (
 );
 
 CREATE TABLE IF NOT EXISTS source_file_map (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_prefix TEXT NOT NULL UNIQUE,
-    source_label  TEXT NOT NULL,
-    nickname      TEXT,
-    account_type  TEXT CHECK (account_type IN ('checking', 'credit_card'))
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_prefix       TEXT NOT NULL UNIQUE,
+    source_label        TEXT NOT NULL,
+    nickname            TEXT,
+    account_type        TEXT,
+    discontinued_since  DATE,
+    replaced_by_prefix  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS column_templates (
@@ -92,7 +94,24 @@ CREATE TABLE IF NOT EXISTS db_audit_log (
     detail    TEXT,
     timestamp DATETIME NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS item_metadata (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_key     TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    category     TEXT,
+    subcategory  TEXT,
+    tax_flags    TEXT
+);
 """
+
+# Enrichment-source seeds inserted on first init. Account types ending in
+# _detail are handled by the enrichment pipeline rather than column templates.
+SEED_ENRICHMENT_SOURCES = [
+    # (source_prefix, source_label, nickname, account_type)
+    ("Venmo",  "Venmo",  "Venmo (shared)",  "venmo_detail"),
+    ("Amazon", "Amazon", "Amazon (shared)", "amazon_detail"),
+]
 
 # Seed data: the full category taxonomy from the spec.
 # Each tuple is (category, subcategory, tax_flag_default).
@@ -178,7 +197,7 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
 
 
 def init_db(db_path: Path | None = None) -> tuple[sqlite3.Connection, bool]:
-    """Create the database if needed, apply schema, and seed categories.
+    """Create the database if needed, apply schema, run migrations, seed defaults.
 
     Returns (connection, is_new) where is_new is True if the database
     was just created for the first time.
@@ -189,12 +208,110 @@ def init_db(db_path: Path | None = None) -> tuple[sqlite3.Connection, bool]:
 
     conn.executescript(SCHEMA_SQL)
 
+    _migrate_source_file_map(conn)
+    _migrate_venmo_to_via_only(conn)
+
     if is_new:
         conn.executemany(
             "INSERT OR IGNORE INTO categories (category, subcategory, tax_flag_default) "
             "VALUES (?, ?, ?)",
             SEED_CATEGORIES,
         )
-        conn.commit()
+
+    # Seed enrichment sources idempotently (safe across upgrades too)
+    conn.executemany(
+        "INSERT OR IGNORE INTO source_file_map "
+        "(source_prefix, source_label, nickname, account_type) VALUES (?, ?, ?, ?)",
+        SEED_ENRICHMENT_SOURCES,
+    )
+    conn.commit()
 
     return conn, is_new
+
+
+def _migrate_source_file_map(conn: sqlite3.Connection) -> None:
+    """Drop the legacy CHECK constraint on account_type and add new columns.
+
+    The original schema constrained account_type to ('checking', 'credit_card').
+    Enrichment sources need additional values ('venmo_detail', 'amazon_detail').
+    SQLite can't ALTER a CHECK constraint in place, so we rebuild the table.
+
+    Idempotent — only runs when the legacy constraint is present. New columns
+    discontinued_since and replaced_by_prefix are added if missing.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='source_file_map'"
+    ).fetchone()
+    if not row:
+        return
+
+    sql = row["sql"]
+    has_old_check = "CHECK (account_type IN" in sql
+    has_discontinued = "discontinued_since" in sql
+    has_replaced = "replaced_by_prefix" in sql
+
+    if has_old_check:
+        # Rebuild the table without the CHECK and with the new columns
+        conn.executescript("""
+            CREATE TABLE source_file_map_new (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_prefix       TEXT NOT NULL UNIQUE,
+                source_label        TEXT NOT NULL,
+                nickname            TEXT,
+                account_type        TEXT,
+                discontinued_since  DATE,
+                replaced_by_prefix  TEXT
+            );
+            INSERT INTO source_file_map_new
+                (id, source_prefix, source_label, nickname, account_type)
+                SELECT id, source_prefix, source_label, nickname, account_type
+                FROM source_file_map;
+            DROP TABLE source_file_map;
+            ALTER TABLE source_file_map_new RENAME TO source_file_map;
+        """)
+        conn.commit()
+        return
+
+    # No CHECK present, but new columns may still be missing on a partially-
+    # migrated DB. Add whichever aren't there.
+    if not has_discontinued:
+        conn.execute("ALTER TABLE source_file_map ADD COLUMN discontinued_since DATE")
+    if not has_replaced:
+        conn.execute("ALTER TABLE source_file_map ADD COLUMN replaced_by_prefix TEXT")
+    conn.commit()
+
+
+def _migrate_venmo_to_via_only(conn: sqlite3.Connection) -> None:
+    """Switch any legacy 'Venmo Payment' placeholder rows to the new convention.
+
+    Old design: VENMO PAYMENT Chase rows normalized to payee='Venmo Payment',
+                with via=NULL. A polluting payee_metadata row mapped
+                'Venmo Payment' to a single category, applying it to every
+                Venmo row regardless of who the real recipient was.
+
+    New design: those Chase rows land at ingest with payee=NULL, via='Venmo'.
+                The real payee comes from the Venmo enrichment file.
+
+    This migration:
+      1. Deletes the polluting payee_metadata row for 'Venmo Payment'
+      2. Deletes the seed payee_normalization rule for 'Venmo Payment'
+      3. Converts existing transactions with payee='Venmo Payment' to
+         payee=NULL, via='Venmo' (preserves status, category, overridden so
+         user's manual work is untouched here — a separate Maintenance action
+         resets those when the user explicitly opts in)
+
+    Idempotent: once converted, no row matches payee='Venmo Payment' again.
+    """
+    conn.execute(
+        "DELETE FROM payee_metadata WHERE normalized_name = 'Venmo Payment'"
+    )
+    conn.execute(
+        "DELETE FROM payee_normalization WHERE normalized_name = 'Venmo Payment'"
+    )
+    conn.execute(
+        "UPDATE transactions "
+        "SET payee = NULL, "
+        "    via = COALESCE(NULLIF(via, ''), 'Venmo') "
+        "WHERE payee = 'Venmo Payment'"
+    )
+    conn.commit()

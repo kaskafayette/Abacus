@@ -3,6 +3,7 @@
 import sqlite3
 
 from db import queries
+from processing.placeholders import is_placeholder_payee
 
 
 def auto_categorize(conn: sqlite3.Connection, transaction_ids: list[int] | None = None):
@@ -46,6 +47,17 @@ def auto_categorize(conn: sqlite3.Connection, transaction_ids: list[int] | None 
     return count
 
 
+def auto_apply_payee_metadata(conn: sqlite3.Connection,
+                               transaction_ids: list[int]) -> int:
+    """Re-apply payee_metadata defaults to a specific set of transactions.
+
+    Called after enrichment patches a Chase row's payee, so the categorize
+    auto-fill from the per-payee learning table lands immediately rather
+    than waiting for the user to open the Categorize tab.
+    """
+    return auto_categorize(conn, transaction_ids=transaction_ids)
+
+
 def apply_category_edits(conn: sqlite3.Connection, edits: list[dict]) -> None:
     """Apply user edits from the category review table.
 
@@ -77,10 +89,18 @@ def save_payee_defaults(conn: sqlite3.Connection, edits: list[dict]) -> None:
 
     Each edit dict should have: normalized_name, category, subcategory,
     tax_flags (optional), payor (optional), note (optional).
+
+    Placeholder payees (e.g. "Venmo Payment", "Amazon") are intentionally
+    skipped — they represent many different real recipients, so generalizing
+    a single user's categorization would mis-train future months. The
+    transaction itself still gets the category; only the per-payee learning
+    row is suppressed.
     """
     for edit in edits:
         name = edit.get("normalized_name")
         if not name:
+            continue
+        if is_placeholder_payee(name):
             continue
         queries.upsert_payee_metadata(
             conn,

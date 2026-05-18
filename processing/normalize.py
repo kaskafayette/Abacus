@@ -4,6 +4,32 @@ import re
 import sqlite3
 
 from db import queries
+from processing.placeholders import ENRICHMENT_VIAS
+
+
+# str.title() treats an apostrophe as a word boundary, so "ANGELA'S" comes out
+# as "Angela'S". For any single-apostrophe-inside-word case, we want the letter
+# after the apostrophe lowercased: possessives ("Angela's"), contractions
+# ("don't", "they're"), and even names ("O'brien"). The user accepts that
+# proper-name convention (O'Brien) gets the lowercase form too — consistency
+# across all apostrophe-words is the rule.
+_APOSTROPHE_FIX_RE = re.compile(r"(?<=[A-Za-z])'([A-Z])")
+
+
+def smart_title(s: str) -> str:
+    """Title-case a string with consistent lowercase letters after apostrophes.
+
+    >>> smart_title("ANGELA'S ORGANIC ICE")
+    "Angela's Organic Ice"
+    >>> smart_title("DON'T STOP")
+    "Don't Stop"
+    >>> smart_title("THEY'RE HERE")
+    "They're Here"
+    >>> smart_title("O'BRIEN'S PUB")
+    "O'brien's Pub"
+    """
+    titled = s.title()
+    return _APOSTROPHE_FIX_RE.sub(lambda m: "'" + m.group(1).lower(), titled)
 
 # Known payment intermediaries — if found in the raw description, extracted into `via`
 VIA_PATTERNS = [
@@ -149,6 +175,11 @@ SEED_NORMALIZATION_RULES = [
     ("POTTERY BARN", "Pottery Barn"),
     ("COMPUPOD", "Compupod"),
     ("Etsy.com", "Etsy"),
+    # eBay: narrow patterns so "JuneBay" or similar can't false-match. Two rules
+    # cover eBay-direct and PayPal-routed eBay charges. Bare "EBAY INC" without
+    # an order ref won't match — add another rule if/when one appears.
+    ("eBay O*", "eBay"),
+    ("PayPal *eBay", "eBay"),
     ("ONEQUINCE", "Quince"),
     ("Noe Valley Books", "Noe Valley Books"),
     ("SNA South Coast News", "South Coast News"),
@@ -227,7 +258,9 @@ SEED_NORMALIZATION_RULES = [
     ("D J*WSJ ONLINE", "Wall Street Journal"),
 
     # Banking / transfers
-    ("VENMO            PAYMENT", "Venmo Payment"),
+    # Note: VENMO PAYMENT intentionally has NO normalization rule. Those rows
+    # land with via='Venmo' and payee=NULL (set at ingest by the default-category
+    # logic) so the Venmo enrichment file fills in the real recipient name.
     ("APPLECARD GSBANK PAYMENT", "Apple Card Payment"),
     ("Payment to Chase card ending in 6190", "Chase Card Payment (6190)"),
     ("Payment to Chase card ending in 7529", "Chase Card Payment (7529)"),
@@ -269,12 +302,12 @@ def _extract_zelle_payee(description: str) -> str | None:
     """Extract the payee name from a Zelle transaction description."""
     m = _ZELLE_RE.search(description)
     if m:
-        return m.group(1).strip().title()
+        return smart_title(m.group(1).strip())
     m = _ZELLE_RE_SIMPLE.search(description)
     if m:
         # Strip trailing reference code (alphanumeric chunk at end)
         name = re.sub(r"\s+\S*\d\S*$", "", m.group(1).strip())
-        return name.title() if name else m.group(1).strip().title()
+        return smart_title(name) if name else smart_title(m.group(1).strip())
     return None
 
 
@@ -289,7 +322,7 @@ def _extract_online_payment_payee(description: str) -> str | None:
     """Extract the payee name from an Online Payment description."""
     m = _ONLINE_PMT_RE.search(description)
     if m:
-        return m.group(1).strip().title()
+        return smart_title(m.group(1).strip())
     return None
 
 
@@ -342,7 +375,7 @@ def auto_suggest_payee(description: str) -> str:
 
     # Title case if it's all caps or all lower
     if name == name.upper() or name == name.lower():
-        name = name.title()
+        name = smart_title(name)
 
     return name if name else description
 
@@ -360,14 +393,25 @@ def normalize_transactions(conn: sqlite3.Connection, transaction_ids: list[int] 
             transaction_ids,
         ).fetchall()
     else:
+        # Exclude rows already tagged with an enrichment via (e.g. Venmo). Those
+        # have payee=NULL by design and will get their payee from an enrichment
+        # file, not from a normalization rule.
         rows = conn.execute(
-            "SELECT * FROM transactions WHERE payee IS NULL AND status = 'pending'"
+            "SELECT * FROM transactions WHERE payee IS NULL AND status = 'pending' "
+            "AND (via IS NULL OR via NOT IN ({}))".format(
+                ",".join("?" * len(ENRICHMENT_VIAS))
+            ),
+            tuple(ENRICHMENT_VIAS),
         ).fetchall()
 
     matched = 0
     unmatched = []
 
     for row in rows:
+        # Skip rows already tagged for enrichment (defensive — also covered by
+        # the query above when transaction_ids is not given)
+        if row["via"] in ENRICHMENT_VIAS:
+            continue
         raw = row["description_raw"]
         via = detect_via(raw)
 

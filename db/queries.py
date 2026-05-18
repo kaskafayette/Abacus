@@ -78,6 +78,48 @@ def upsert_source_file_map(conn: sqlite3.Connection, prefix: str, label: str,
     conn.commit()
 
 
+def get_source_row(conn: sqlite3.Connection, prefix: str) -> sqlite3.Row | None:
+    """Full source_file_map row for a prefix, including continuity columns."""
+    return conn.execute(
+        "SELECT * FROM source_file_map WHERE source_prefix = ?", (prefix,)
+    ).fetchone()
+
+
+def get_account_type(conn: sqlite3.Connection, prefix: str) -> str | None:
+    row = conn.execute(
+        "SELECT account_type FROM source_file_map WHERE source_prefix = ?", (prefix,)
+    ).fetchone()
+    return row["account_type"] if row else None
+
+
+def set_replaced_by_prefix(conn: sqlite3.Connection, old_prefix: str, new_prefix: str) -> None:
+    """Link an old (reissued/discontinued) account to its replacement."""
+    conn.execute(
+        "UPDATE source_file_map SET replaced_by_prefix = ? WHERE source_prefix = ?",
+        (new_prefix, old_prefix),
+    )
+    conn.commit()
+
+
+def mark_account_discontinued(conn: sqlite3.Connection, prefix: str, since: str | None = None) -> None:
+    """Mark an account as discontinued so missing-account warnings stop firing."""
+    from datetime import date as _date
+    when = since or _date.today().isoformat()
+    conn.execute(
+        "UPDATE source_file_map SET discontinued_since = ? WHERE source_prefix = ?",
+        (when, prefix),
+    )
+    conn.commit()
+
+
+def get_active_sources(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Source rows that aren't marked discontinued."""
+    return conn.execute(
+        "SELECT * FROM source_file_map WHERE discontinued_since IS NULL "
+        "ORDER BY source_prefix"
+    ).fetchall()
+
+
 # ---------------------------------------------------------------------------
 # Column templates
 # ---------------------------------------------------------------------------
@@ -328,6 +370,56 @@ def compute_file_hash(filepath: Path) -> str:
     return h.hexdigest()
 
 
+def get_sources_seen_in_history(conn: sqlite3.Connection) -> dict[str, str]:
+    """Map of source_prefix → most-recent date_range_end seen in processed_files.
+
+    Used for the cross-source completeness check at Ingest time.
+    """
+    rows = conn.execute(
+        "SELECT source_prefix, MAX(date_range_end) AS last_end "
+        "FROM processed_files GROUP BY source_prefix"
+    ).fetchall()
+    return {r["source_prefix"]: r["last_end"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Item metadata (Amazon line-item learning)
+# ---------------------------------------------------------------------------
+
+def get_item_metadata(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM item_metadata ORDER BY display_name"
+    ).fetchall()
+
+
+def get_item_metadata_by_key(conn: sqlite3.Connection, item_key: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM item_metadata WHERE item_key = ?", (item_key,)
+    ).fetchone()
+
+
+def upsert_item_metadata(conn: sqlite3.Connection, item_key: str, display_name: str,
+                          category: str | None = None,
+                          subcategory: str | None = None,
+                          tax_flags: str | None = None) -> None:
+    conn.execute(
+        "INSERT INTO item_metadata (item_key, display_name, category, subcategory, tax_flags) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT (item_key) DO UPDATE SET "
+        "display_name = excluded.display_name, "
+        "category = excluded.category, "
+        "subcategory = excluded.subcategory, "
+        "tax_flags = excluded.tax_flags",
+        (item_key, display_name, category, subcategory, tax_flags),
+    )
+    conn.commit()
+
+
+def delete_item_metadata(conn: sqlite3.Connection, row_id: int) -> None:
+    conn.execute("DELETE FROM item_metadata WHERE id = ?", (row_id,))
+    conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # Stats / utility
 # ---------------------------------------------------------------------------
@@ -335,7 +427,8 @@ def compute_file_hash(filepath: Path) -> str:
 def get_table_counts(conn: sqlite3.Connection) -> dict[str, int]:
     """Row counts for all tables."""
     tables = ["transactions", "payee_normalization", "payee_metadata",
-              "categories", "source_file_map", "column_templates", "processed_files"]
+              "categories", "source_file_map", "column_templates", "processed_files",
+              "item_metadata"]
     counts = {}
     for t in tables:
         row = conn.execute(f"SELECT COUNT(*) as cnt FROM {t}").fetchone()
