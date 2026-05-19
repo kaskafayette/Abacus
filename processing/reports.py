@@ -134,14 +134,30 @@ def _safe(val) -> str:
 class AbacusPDF(FPDF):
     """Landscape letter PDF with consistent headers/footers."""
 
+    # GitHub-style green used for credits (positive amounts).
+    GREEN_RGB = (63, 185, 80)
+
     def __init__(self, title: str = "Abacus Report"):
         super().__init__(orientation="L", unit="mm", format="Letter")
         self._title = _safe(title)
+        self._section: str = ""  # set by section writers; included in per-page header
         self.set_auto_page_break(auto=True, margin=15)
+
+    def set_section(self, section: str):
+        """Set the section name shown in the per-page header.
+
+        Call this right before pdf.add_page() so the new page's header picks
+        up the new section. Carries over to continuation pages within the
+        same section automatically.
+        """
+        self._section = _safe(section)
 
     def header(self):
         self.set_font("Helvetica", "B", 12)
-        self.cell(0, 8, self._title, new_x="LMARGIN", new_y="NEXT")
+        text = self._title
+        if self._section:
+            text = f"{text} — {self._section}"  # em dash separator
+        self.cell(0, 8, _safe(text), new_x="LMARGIN", new_y="NEXT")
         self.ln(2)
 
     def footer(self):
@@ -165,22 +181,49 @@ class AbacusPDF(FPDF):
         self.ln()
 
     def table_row(self, widths: list[float], values: list[str],
-                  bold: bool = False, fill: bool = False):
+                  bold: bool = False, fill: bool = False,
+                  amount_cols: list[int] | None = None):
+        """Print a row. If `amount_cols` lists column indices, those columns
+        are interpreted as signed currency strings (e.g. "$12.34" or "-$5.00")
+        and rendered in green when positive.
+        """
         style = "B" if bold else ""
         self.set_font("Helvetica", style, 7)
         if fill:
             self.set_fill_color(245, 245, 245)
-        for w, v in zip(widths, values):
-            self.cell(w, 4.5, _safe(v), border=1, fill=fill)
+        amount_cols = set(amount_cols or [])
+        for i, (w, v) in enumerate(zip(widths, values)):
+            s = _safe(v)
+            is_positive_amount = (
+                i in amount_cols
+                and s
+                and not s.startswith("-")
+                and ("$" in s)
+            )
+            if is_positive_amount:
+                self.set_text_color(*self.GREEN_RGB)
+                self.cell(w, 4.5, s, border=1, fill=fill, align="R")
+                self.set_text_color(0, 0, 0)
+            else:
+                # Right-align money cols even when negative
+                align = "R" if i in amount_cols else ""
+                self.cell(w, 4.5, s, border=1, fill=fill, align=align)
         self.ln()
 
-    def group_header(self, text: str, level: int = 0):
-        """Print a group header row spanning the full width."""
+    def group_header(self, text: str, level: int = 0,
+                     width: float | None = None):
+        """Print a group header row. By default the grey bar spans the full
+        printable width; pass `width` to limit it to the table's actual width.
+        """
         indent = "    " * level
         self.set_font("Helvetica", "B", 7 if level > 0 else 8)
-        self.set_fill_color(235, 235, 235) if level == 0 else self.set_fill_color(242, 242, 242)
-        self.cell(0, 5, f"{indent}{_safe(text)}", border=0, fill=True,
-                  new_x="LMARGIN", new_y="NEXT")
+        if level == 0:
+            self.set_fill_color(235, 235, 235)
+        else:
+            self.set_fill_color(242, 242, 242)
+        bar_width = width if width is not None else (self.w - self.l_margin - self.r_margin)
+        self.cell(bar_width, 5, f"{indent}{_safe(text)}", border=0, fill=True)
+        self.ln()
 
     def subtotal_row(self, label: str, amount: str, indent: int = 0):
         """Print a subtotal row."""
@@ -193,116 +236,409 @@ class AbacusPDF(FPDF):
         self.cell(35, 4.5, _safe(amount), border=0, fill=True, align="R")
         self.ln()
 
+    # -----------------------------------------------------------------------
+    # Summary-table helpers (4-column: label | month-count | month-$ | YTD-count | YTD-$)
+    # -----------------------------------------------------------------------
+
+    def summary_header(self, label_w: float, count_w: float, amount_w: float,
+                       label_title: str = "", has_ytd: bool = True):
+        """Two-row table header for summary tables:
+          Row 1: <label>  |  Month (spans 2)  |  YTD (spans 2)
+          Row 2: Category |  Count |  Total   |  Count |  Total
+        """
+        self.set_font("Helvetica", "B", 7)
+        self.set_fill_color(220, 220, 220)
+        merged = count_w + amount_w
+        # Row 1
+        self.cell(label_w, 5, "", border=1, fill=True)
+        self.cell(merged, 5, "Month", border=1, fill=True, align="C")
+        if has_ytd:
+            self.cell(merged, 5, "YTD", border=1, fill=True, align="C")
+        self.ln()
+        # Row 2
+        self.set_fill_color(235, 235, 235)
+        self.cell(label_w, 5, label_title, border=1, fill=True)
+        self.cell(count_w, 5, "Count", border=1, fill=True, align="R")
+        self.cell(amount_w, 5, "Total", border=1, fill=True, align="R")
+        if has_ytd:
+            self.cell(count_w, 5, "Count", border=1, fill=True, align="R")
+            self.cell(amount_w, 5, "Total", border=1, fill=True, align="R")
+        self.ln()
+
+    def summary_row(self, label_w: float, count_w: float, amount_w: float,
+                    label: str,
+                    month_count: int | str, month_amt,
+                    ytd_count: int | str | None = None, ytd_amt=None,
+                    bold: bool = False, fill: bool = False):
+        """Render a 4-col data row (or 2-col when ytd_count is None).
+
+        Amount columns auto-render in green when the underlying value is > 0.
+        """
+        style = "B" if bold else ""
+        self.set_font("Helvetica", style, 7)
+        if fill:
+            self.set_fill_color(245, 245, 245)
+
+        # Label
+        self.cell(label_w, 4.5, _safe(label), border=1, fill=fill)
+
+        # Month count + amount
+        self.cell(count_w, 4.5, _safe(str(month_count) if month_count != "" else ""),
+                  border=1, fill=fill, align="R")
+        self._amount_cell(amount_w, month_amt, fill=fill)
+
+        # YTD count + amount (optional)
+        if ytd_count is not None:
+            self.cell(count_w, 4.5, _safe(str(ytd_count) if ytd_count != "" else ""),
+                      border=1, fill=fill, align="R")
+            self._amount_cell(amount_w, ytd_amt, fill=fill)
+
+        self.ln()
+
+    def summary_subtotal_header(self, label_w: float, count_w: float, amount_w: float,
+                                  label: str,
+                                  month_count: int | str, month_amt,
+                                  ytd_count: int | str | None = None, ytd_amt=None,
+                                  level: int = 0):
+        """A banner row that doubles as a subtotal: grey-fill row with the
+        group label on the left and bold count/amount cells on the right that
+        match the data-table column widths. Used as a category or subcategory
+        header that simultaneously shows the subtotal — avoids a separate
+        "SUBTOTAL" line below the group.
+
+        level=0 gets a darker grey (matches existing group_header level 0);
+        level=1 gets the lighter grey for subcategory bands.
+        """
+        indent = "    " * level
+        fill_color = (235, 235, 235) if level == 0 else (242, 242, 242)
+        self.set_fill_color(*fill_color)
+        self.set_font("Helvetica", "B", 8 if level == 0 else 7)
+
+        self.cell(label_w, 5, f"{indent}{_safe(label)}", border=1, fill=True)
+        self.cell(count_w, 5,
+                  _safe(str(month_count) if month_count != "" else ""),
+                  border=1, fill=True, align="R")
+        self._amount_cell(amount_w, month_amt, fill=True, height=5)
+        if ytd_count is not None:
+            self.cell(count_w, 5,
+                      _safe(str(ytd_count) if ytd_count != "" else ""),
+                      border=1, fill=True, align="R")
+            self._amount_cell(amount_w, ytd_amt, fill=True, height=5)
+        self.ln()
+
+    def _amount_cell(self, width: float, amount, fill: bool = False,
+                     height: float = 4.5):
+        """Render one currency cell. Green text when amount > 0; black otherwise.
+        Accepts Decimal, float, int, or pre-formatted string.
+        """
+        # Determine numeric value to decide color
+        is_positive = False
+        try:
+            if isinstance(amount, str):
+                if amount and not amount.startswith("-") and "$" in amount:
+                    is_positive = True
+            else:
+                is_positive = Decimal(str(amount)) > 0
+        except Exception:
+            is_positive = False
+
+        # Format if numeric, otherwise treat as pre-formatted
+        if isinstance(amount, str):
+            text = amount
+        elif amount is None or amount == "":
+            text = ""
+        else:
+            text = _fmt_amt(amount)
+
+        if is_positive:
+            self.set_text_color(*self.GREEN_RGB)
+        self.cell(width, height, _safe(text), border=1, fill=fill, align="R")
+        self.set_text_color(0, 0, 0)
+
 
 # ---------------------------------------------------------------------------
 # Section builders
 # ---------------------------------------------------------------------------
 
+def _category_sort_key(cat: str) -> tuple[int, str]:
+    """Sort key that puts Income at the top, Transfer at the bottom, and
+    every other category in between (alphabetical). Used to give the
+    Category Summary and Payee Summary the same top-down flow as the
+    Cash Flow Summary on page 2: income sources first, then spending."""
+    if cat == "Income":
+        return (0, cat)
+    if cat == "Transfer":
+        return (2, cat)
+    return (1, cat)
+
+def _write_cash_flow_summary(pdf: AbacusPDF, month_txns, ytd_txns):
+    """Cash flow summary: breaks Income into its subcategories, then computes
+    'Burn Rate' as the sum of everything that's not Income and not Transfer.
+    Credits in non-Income categories (refunds, returns, tax refunds) naturally
+    offset debits in the same category because the sum nets them. Final line
+    shows Net Cash Flow = Income + Burn (where Burn is negative).
+
+    Inputs may contain Transfer transactions; this function filters them out.
+    """
+    pdf.section_title("Cash Flow Summary (Month & YTD)")
+
+    INCOME = "Income"
+    EXCLUDED_FROM_BURN = {"Income", "Transfer"}
+
+    def _aggregate(txns):
+        """Return (income_by_subcat, burn_count, burn_total)."""
+        income: dict[str, list] = {}  # subcat -> [count, total]
+        burn_c, burn_t = 0, Decimal(0)
+        for t in txns:
+            cat = t.get("category") or ""
+            sub = t.get("subcategory") or ""
+            amt = Decimal(str(t["amount"]))
+            if cat == INCOME:
+                slot = income.setdefault(sub, [0, Decimal(0)])
+                slot[0] += 1
+                slot[1] += amt
+            elif cat in EXCLUDED_FROM_BURN:
+                continue  # exclude transfers
+            else:
+                burn_c += 1
+                burn_t += amt
+        return income, burn_c, burn_t
+
+    m_income, m_burn_c, m_burn_t = _aggregate(month_txns)
+    y_income, y_burn_c, y_burn_t = _aggregate(ytd_txns)
+
+    LABEL_W, COUNT_W, AMT_W = 100, 20, 35
+    table_w = LABEL_W + (COUNT_W + AMT_W) * 2
+    pdf.summary_header(LABEL_W, COUNT_W, AMT_W, "Item")
+
+    # Income breakdown
+    pdf.group_header("Income (sources of cash)", level=0, width=table_w)
+    income_subs = sorted(set(m_income.keys()) | set(y_income.keys()))
+    for sub in income_subs:
+        m_c, m_t = m_income.get(sub, [0, Decimal(0)])
+        y_c, y_t = y_income.get(sub, [0, Decimal(0)])
+        label = f"    {sub or '(no subcategory)'}"
+        pdf.summary_row(LABEL_W, COUNT_W, AMT_W,
+                        label,
+                        m_c or "", m_t, y_c or "", y_t)
+    # Income subtotal
+    m_inc_c = sum(slot[0] for slot in m_income.values())
+    m_inc_t = sum((slot[1] for slot in m_income.values()), Decimal(0))
+    y_inc_c = sum(slot[0] for slot in y_income.values())
+    y_inc_t = sum((slot[1] for slot in y_income.values()), Decimal(0))
+    pdf.summary_row(LABEL_W, COUNT_W, AMT_W,
+                    "  TOTAL INCOME",
+                    m_inc_c or "", m_inc_t, y_inc_c or "", y_inc_t,
+                    bold=True, fill=True)
+
+    pdf.ln(2)
+
+    # Burn rate
+    pdf.group_header("Spending (Burn Rate)", level=0, width=table_w)
+    pdf.summary_row(LABEL_W, COUNT_W, AMT_W,
+                    "    Net spending (all categories except Income / Transfer;",
+                    m_burn_c, m_burn_t, y_burn_c, y_burn_t,
+                    bold=True, fill=True)
+    pdf.set_font("Helvetica", "I", 6)
+    pdf.cell(0, 4, "    credits like refunds/returns/tax refunds offset debits within the same category)")
+    pdf.ln()
+    pdf.set_font("Helvetica", "", 7)
+
+    pdf.ln(2)
+
+    # Net cash flow = Income + Burn (burn is negative, so this is income - spending)
+    m_net = m_inc_t + m_burn_t
+    y_net = y_inc_t + y_burn_t
+    pdf.summary_row(LABEL_W, COUNT_W, AMT_W,
+                    "NET CASH FLOW (Income + Burn)",
+                    "", m_net, "", y_net,
+                    bold=True, fill=True)
+
+    pdf.ln(6)
+
+
 def _write_category_summary(pdf: AbacusPDF, month_txns, ytd_txns):
-    """Section 1: Category Summary (Month & YTD) - grouped by category."""
+    """Section 1: Category Summary (Month & YTD) - grouped by category.
+
+    Four data columns: month count, month total, YTD count, YTD total.
+    Credits (positive totals) render in green.
+    Prefixed by a Cash Flow Summary (income vs burn rate vs net).
+    """
+    # Cash flow summary at the top of this section
+    _write_cash_flow_summary(pdf, month_txns, ytd_txns)
+
     pdf.section_title("Category Summary (Month & YTD)")
 
-    month_totals = _sum_by(month_txns, "category", "subcategory")
-    ytd_totals = _sum_by(ytd_txns, "category", "subcategory")
-    all_keys = sorted(set(month_totals.keys()) | set(ytd_totals.keys()))
+    def _aggregate(txns):
+        """Return (count_by_key, total_by_key) where key is (cat, subcat)."""
+        counts: dict[tuple, int] = {}
+        totals: dict[tuple, Decimal] = {}
+        for t in txns:
+            key = (t.get("category") or "", t.get("subcategory") or "")
+            counts[key] = counts.get(key, 0) + 1
+            totals[key] = totals.get(key, Decimal(0)) + Decimal(t["amount"])
+        return counts, totals
 
-    # Get unique categories in order
-    categories = []
-    seen = set()
-    for key in all_keys:
-        if key[0] not in seen:
-            categories.append(key[0])
-            seen.add(key[0])
+    m_counts, m_totals = _aggregate(month_txns)
+    y_counts, y_totals = _aggregate(ytd_txns)
+    all_keys = sorted(set(m_totals.keys()) | set(y_totals.keys()))
 
-    widths = [120, 35, 35]
-    pdf.table_header(widths, ["", "Month", "YTD"])
+    # Unique categories, ordered: Income first, others alphabetical, Transfer last
+    categories: list[str] = sorted(
+        {k[0] for k in all_keys},
+        key=_category_sort_key,
+    )
+
+    # Column widths: label, month count, month $, ytd count, ytd $
+    LABEL_W, COUNT_W, AMT_W = 100, 20, 35
+    table_w = LABEL_W + (COUNT_W + AMT_W) * 2
+    pdf.summary_header(LABEL_W, COUNT_W, AMT_W, "Category")
 
     for cat in categories:
-        # Category header
-        pdf.group_header(cat, level=0)
+        # Category banner row doubles as the subtotal — shows the category
+        # name on the left and its month/YTD totals on the right in bold.
+        cat_m_c = sum(v for k, v in m_counts.items() if k[0] == cat)
+        cat_m_t = sum((v for k, v in m_totals.items() if k[0] == cat), Decimal(0))
+        cat_y_c = sum(v for k, v in y_counts.items() if k[0] == cat)
+        cat_y_t = sum((v for k, v in y_totals.items() if k[0] == cat), Decimal(0))
+        pdf.summary_subtotal_header(LABEL_W, COUNT_W, AMT_W,
+                                     cat,
+                                     cat_m_c or "", cat_m_t,
+                                     cat_y_c or "", cat_y_t,
+                                     level=0)
 
+        # Subcategory data rows below the banner
         cat_keys = [k for k in all_keys if k[0] == cat]
         for key in cat_keys:
             _, subcat = key
             if subcat:
-                m = month_totals.get(key, Decimal(0))
-                y = ytd_totals.get(key, Decimal(0))
-                pdf.table_row(widths, [f"    {subcat}", _fmt_amt(m), _fmt_amt(y)])
-
-        # Category subtotal
-        cat_month = sum(v for k, v in month_totals.items() if k[0] == cat)
-        cat_ytd = sum(v for k, v in ytd_totals.items() if k[0] == cat)
-        pdf.table_row(widths, [f"  SUBTOTAL {cat}", _fmt_amt(cat_month), _fmt_amt(cat_ytd)],
-                      bold=True, fill=True)
+                m_c = m_counts.get(key, 0) or ""
+                m_t = m_totals.get(key, Decimal(0))
+                y_c = y_counts.get(key, 0) or ""
+                y_t = y_totals.get(key, Decimal(0))
+                pdf.summary_row(LABEL_W, COUNT_W, AMT_W,
+                                f"    {subcat}",
+                                m_c, m_t, y_c, y_t)
 
     # Grand total
-    grand_month = sum(month_totals.values(), Decimal(0))
-    grand_ytd = sum(ytd_totals.values(), Decimal(0))
+    grand_m_c = sum(m_counts.values())
+    grand_m_t = sum(m_totals.values(), Decimal(0))
+    grand_y_c = sum(y_counts.values())
+    grand_y_t = sum(y_totals.values(), Decimal(0))
     pdf.ln(2)
-    pdf.table_row(widths, ["GRAND TOTAL", _fmt_amt(grand_month), _fmt_amt(grand_ytd)],
-                  bold=True, fill=True)
+    pdf.summary_row(LABEL_W, COUNT_W, AMT_W,
+                    "GRAND TOTAL",
+                    grand_m_c, grand_m_t, grand_y_c, grand_y_t,
+                    bold=True, fill=True)
 
 
-def _write_payee_summary(pdf: AbacusPDF, month_txns):
-    """Section 2: Payee Summary (Month) - grouped by category/subcategory."""
-    pdf.section_title("Payee Summary (Month)")
+def _write_payee_summary(pdf: AbacusPDF, month_txns, ytd_txns):
+    """Section 2: Payee Summary (Month & YTD) - grouped by category/subcategory.
 
-    # Group by cat, subcat, payee
-    groups: dict[tuple, list] = {}
-    for t in month_txns:
-        key = (t.get("category") or "", t.get("subcategory") or "", t.get("payee") or "")
-        groups.setdefault(key, []).append(t)
+    Four data columns: month count, month total, YTD count, YTD total.
+    Credits (positive totals) render in green.
+    """
+    pdf.section_title("Payee Summary (Month & YTD)")
 
-    widths = [100, 15, 35]
-    pdf.table_header(widths, ["Payee", "#", "Total"])
+    def _aggregate_by_payee(txns):
+        """{(cat, subcat, payee): (count, total)}"""
+        out: dict[tuple, tuple[int, Decimal]] = {}
+        for t in txns:
+            key = (t.get("category") or "", t.get("subcategory") or "",
+                   t.get("payee") or "")
+            c, tot = out.get(key, (0, Decimal(0)))
+            out[key] = (c + 1, tot + Decimal(t["amount"]))
+        return out
+
+    m_by_payee = _aggregate_by_payee(month_txns)
+    y_by_payee = _aggregate_by_payee(ytd_txns)
+    # Sort: Income categories first (alphabetical within), then other expense
+    # categories alphabetical, then Transfer last. Within each category,
+    # alphabetical by subcategory and payee.
+    all_keys = sorted(
+        set(m_by_payee.keys()) | set(y_by_payee.keys()),
+        key=lambda k: (_category_sort_key(k[0]), k[1], k[2]),
+    )
+
+    LABEL_W, COUNT_W, AMT_W = 100, 20, 35
+    pdf.summary_header(LABEL_W, COUNT_W, AMT_W, "Payee")
+
+    # Pre-compute subtotals at the category and (category, subcategory) levels
+    # so the banner rows can show them inline.
+    def _subtotals_at(level: int):
+        """level=1 -> by (cat,), level=2 -> by (cat, subcat)."""
+        m_out: dict[tuple, tuple[int, Decimal]] = {}
+        y_out: dict[tuple, tuple[int, Decimal]] = {}
+        for src, dest in [(m_by_payee, m_out), (y_by_payee, y_out)]:
+            for k, (c, t) in src.items():
+                bucket = k[:level]
+                pc, pt = dest.get(bucket, (0, Decimal(0)))
+                dest[bucket] = (pc + c, pt + t)
+        return m_out, y_out
+
+    m_cat, y_cat = _subtotals_at(1)
+    m_subcat, y_subcat = _subtotals_at(2)
 
     current_cat = None
     current_subcat = None
 
-    for key in sorted(groups.keys()):
+    for key in all_keys:
         cat, subcat, payee = key
-        txns = groups[key]
-        total = sum(Decimal(t["amount"]) for t in txns)
+        m_c, m_t = m_by_payee.get(key, (0, Decimal(0)))
+        y_c, y_t = y_by_payee.get(key, (0, Decimal(0)))
 
-        # Category header
         if cat != current_cat:
-            pdf.group_header(cat, level=0)
+            cm_c, cm_t = m_cat.get((cat,), (0, Decimal(0)))
+            cy_c, cy_t = y_cat.get((cat,), (0, Decimal(0)))
+            pdf.summary_subtotal_header(LABEL_W, COUNT_W, AMT_W,
+                                          cat,
+                                          cm_c or "", cm_t,
+                                          cy_c or "", cy_t,
+                                          level=0)
             current_cat = cat
             current_subcat = None
 
-        # Subcategory header
         if subcat and subcat != current_subcat:
-            pdf.group_header(subcat, level=1)
+            sm_c, sm_t = m_subcat.get((cat, subcat), (0, Decimal(0)))
+            sy_c, sy_t = y_subcat.get((cat, subcat), (0, Decimal(0)))
+            pdf.summary_subtotal_header(LABEL_W, COUNT_W, AMT_W,
+                                          subcat,
+                                          sm_c or "", sm_t,
+                                          sy_c or "", sy_t,
+                                          level=1)
             current_subcat = subcat
 
-        # Payee row
         indent = "        " if subcat else "    "
-        pdf.table_row(widths, [f"{indent}{payee}", str(len(txns)), _fmt_amt(total)])
+        pdf.summary_row(LABEL_W, COUNT_W, AMT_W,
+                        f"{indent}{payee}",
+                        m_c or "", m_t,
+                        y_c or "", y_t)
 
-    # Subcategory subtotals and category subtotals
-    # Recompute with subtotals
+    # Grand total
+    grand_m_c = sum(c for c, _ in m_by_payee.values())
+    grand_m_t = sum((t for _, t in m_by_payee.values()), Decimal(0))
+    grand_y_c = sum(c for c, _ in y_by_payee.values())
+    grand_y_t = sum((t for _, t in y_by_payee.values()), Decimal(0))
     pdf.ln(2)
-    cat_totals = _sum_by(month_txns, "category")
-    for cat_key in sorted(cat_totals.keys()):
-        cat = cat_key[0]
-        pdf.table_row(widths, [f"  SUBTOTAL {cat}", "", _fmt_amt(cat_totals[cat_key])],
-                      bold=True, fill=True)
-
-    grand = sum(Decimal(t["amount"]) for t in month_txns)
-    pdf.ln(2)
-    pdf.table_row(widths, ["GRAND TOTAL", "", _fmt_amt(grand)], bold=True, fill=True)
+    pdf.summary_row(LABEL_W, COUNT_W, AMT_W,
+                    "GRAND TOTAL",
+                    grand_m_c, grand_m_t, grand_y_c, grand_y_t,
+                    bold=True, fill=True)
 
 
 def _write_transaction_detail(pdf: AbacusPDF, month_txns):
-    """Section 3: Transaction Detail (Month) - grouped by category/subcategory."""
+    """Section 3: Transaction Detail (Month) - grouped by category/subcategory.
+
+    Credit amounts render in green; grey group headers span only the table width.
+    """
     pdf.section_title("Transaction Detail (Month)")
 
-    # Sort by category, subcategory, date
     sorted_txns = sorted(month_txns, key=lambda x: (
         x.get("category") or "", x.get("subcategory") or "", x["date"]
     ))
 
     widths = [20, 50, 20, 25, 20, 40]
+    table_w = sum(widths)
     pdf.table_header(widths, ["Date", "Payee", "Via", "Amount", "Payor", "Note"])
 
     current_cat = None
@@ -313,22 +649,27 @@ def _write_transaction_detail(pdf: AbacusPDF, month_txns):
         subcat = t.get("subcategory") or ""
 
         if cat != current_cat:
-            pdf.group_header(cat, level=0)
+            pdf.group_header(cat, level=0, width=table_w)
             current_cat = cat
             current_subcat = None
 
         if subcat and subcat != current_subcat:
-            pdf.group_header(subcat, level=1)
+            pdf.group_header(subcat, level=1, width=table_w)
             current_subcat = subcat
 
         pdf.table_row(widths, [
             t["date"], t.get("payee") or "", t.get("via") or "",
             _fmt_amt(t["amount"]), t.get("payor") or "", t.get("note") or "",
-        ])
+        ], amount_cols=[3])
 
 
 def _write_tax_items(pdf: AbacusPDF, month_txns, ytd_txns):
-    """Section 4: Tax Items Report (Month & YTD) - grouped by tax flag."""
+    """Section 4: Tax Items Report (Month & YTD) - grouped by tax flag.
+
+    Starts with a 4-column summary table (flag | month count | month $ | YTD
+    count | YTD $), then lists per-flag detail with month transactions.
+    Credits (positive amounts) render in green throughout.
+    """
     pdf.section_title("Tax Items (Month & YTD)")
 
     def _by_flag(txns):
@@ -351,11 +692,26 @@ def _write_tax_items(pdf: AbacusPDF, month_txns, ytd_txns):
         pdf.cell(0, 6, "No tax-flagged transactions in this period.")
         return
 
-    widths = [20, 50, 40, 25, 40]
+    # --- 4-column summary table at top ---
+    LABEL_W, COUNT_W, AMT_W = 100, 20, 35
+    pdf.summary_header(LABEL_W, COUNT_W, AMT_W, "Tax Flag")
+    for flag in all_flags:
+        m_t = month_by_flag.get(flag, [])
+        y_t = ytd_by_flag.get(flag, [])
+        pdf.summary_row(LABEL_W, COUNT_W, AMT_W,
+                        flag,
+                        len(m_t), sum((Decimal(t["amount"]) for t in m_t), Decimal(0)),
+                        len(y_t), sum((Decimal(t["amount"]) for t in y_t), Decimal(0)))
+
+    pdf.ln(4)
+
+    # --- Per-flag detail listings ---
+    detail_widths = [20, 50, 40, 25, 40]
+    detail_table_w = sum(detail_widths)
 
     for flag in all_flags:
-        pdf.group_header(flag, level=0)
-        pdf.table_header(widths, ["Date", "Payee", "Category", "Amount", "Note"])
+        pdf.group_header(f"{flag} — Detail", level=0, width=detail_table_w)
+        pdf.table_header(detail_widths, ["Date", "Payee", "Category", "Amount", "Note"])
 
         m_txns = month_by_flag.get(flag, [])
         y_txns = ytd_by_flag.get(flag, [])
@@ -364,13 +720,13 @@ def _write_tax_items(pdf: AbacusPDF, month_txns, ytd_txns):
             cat_label = t.get("category") or ""
             if t.get("subcategory"):
                 cat_label += f" / {t['subcategory']}"
-            pdf.table_row(widths, [
+            pdf.table_row(detail_widths, [
                 t["date"], t.get("payee") or "", cat_label,
                 _fmt_amt(t["amount"]), t.get("note") or "",
-            ])
+            ], amount_cols=[3])
 
-        m_total = sum(Decimal(t["amount"]) for t in m_txns)
-        y_total = sum(Decimal(t["amount"]) for t in y_txns)
+        m_total = sum((Decimal(t["amount"]) for t in m_txns), Decimal(0))
+        y_total = sum((Decimal(t["amount"]) for t in y_txns), Decimal(0))
         pdf.subtotal_row(f"Month subtotal - {flag}", _fmt_amt(m_total), indent=1)
         pdf.subtotal_row(f"YTD subtotal - {flag}", _fmt_amt(y_total), indent=1)
         pdf.ln(2)
@@ -490,9 +846,15 @@ def _write_checksums(pdf: AbacusPDF, conn, start, end,
                            str(rpt_xfer_count),
                            _fmt_amt(rpt_xfer_total)])
 
-    # Match check
+    # Match check — quantize to cents before comparing. SQLite stores `amount`
+    # as REAL (float), so the DB-side SUM and the Python-side Decimal sum can
+    # diverge by ~1e-13 from float noise even though they round to the same
+    # dollar value. The user-visible totals are already in cents; equality
+    # at that precision is the correct integrity signal.
+    def _cents(v):
+        return Decimal(str(v)).quantize(Decimal("0.01"))
     month_match = (rpt_month_count == db_month_in_scope["cnt"] and
-                   Decimal(str(rpt_month_total)) == Decimal(str(db_month_in_scope["total"])))
+                   _cents(rpt_month_total) == _cents(db_month_in_scope["total"]))
     pdf.table_row(widths, [
         "MONTH MATCH" if month_match else "*** MONTH MISMATCH ***",
         "OK" if month_match else "FAIL", ""
@@ -516,7 +878,7 @@ def _write_checksums(pdf: AbacusPDF, conn, start, end,
                            _fmt_amt(rpt_ytd_no_xfer_total)])
 
     ytd_match = (rpt_ytd_count == db_ytd_in_scope["cnt"] and
-                 Decimal(str(rpt_ytd_total)) == Decimal(str(db_ytd_in_scope["total"])))
+                 _cents(rpt_ytd_total) == _cents(db_ytd_in_scope["total"]))
     pdf.table_row(widths, [
         "YTD MATCH" if ytd_match else "*** YTD MISMATCH ***",
         "OK" if ytd_match else "FAIL", ""
@@ -601,12 +963,14 @@ def generate_monthly_pdf(conn: sqlite3.Connection, start: str, end: str,
     pdf.alias_nb_pages()
 
     # Page 1: scope + missing-payee banners, then the checksum table.
+    pdf.set_section("Scope & Checksums")
     pdf.add_page()
     _write_top_banners(pdf, conn, start, end, mode)
     _write_checksums(pdf, conn, start, end, month_txns, ytd_txns,
                      month_no_xfer, ytd_no_xfer, month_xfer, mode=mode)
 
     if "category_summary" in sections:
+        pdf.set_section("Category Summary")
         pdf.add_page()
         _write_category_summary(pdf, month_no_xfer, ytd_no_xfer)
         if month_xfer:
@@ -616,14 +980,17 @@ def generate_monthly_pdf(conn: sqlite3.Connection, start: str, end: str,
             pdf.cell(0, 4, f"Note: {len(month_xfer)} transfer(s) totaling {_fmt_amt(xfer_total)} excluded from summaries.")
 
     if "payee_summary" in sections:
+        pdf.set_section("Payee Summary")
         pdf.add_page()
-        _write_payee_summary(pdf, month_no_xfer)
+        _write_payee_summary(pdf, month_no_xfer, ytd_no_xfer)
 
     if "transaction_detail" in sections:
+        pdf.set_section("Transaction Detail")
         pdf.add_page()
         _write_transaction_detail(pdf, month_txns)
 
     if "tax_items" in sections:
+        pdf.set_section("Tax Items")
         pdf.add_page()
         _write_tax_items(pdf, month_no_xfer, ytd_no_xfer)
 

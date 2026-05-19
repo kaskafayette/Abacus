@@ -119,6 +119,8 @@ SEED_CATEGORIES = [
     # Income
     ("Income", "Social Security (net)", None),
     ("Income", "W2 and 1099 (net)", None),
+    ("Income", "Investment Drawdown", None),
+    ("Income", "Other", None),
     # Transfer
     ("Transfer", None, None),
     # Household

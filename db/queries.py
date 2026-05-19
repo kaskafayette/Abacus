@@ -59,8 +59,10 @@ def get_source_file_map(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def get_source_label(conn: sqlite3.Connection, prefix: str) -> str | None:
+    """Case-insensitive lookup of source_label by prefix."""
     row = conn.execute(
-        "SELECT source_label FROM source_file_map WHERE source_prefix = ?", (prefix,)
+        "SELECT source_label FROM source_file_map WHERE source_prefix = ? COLLATE NOCASE",
+        (prefix,),
     ).fetchone()
     return row["source_label"] if row else None
 
@@ -79,15 +81,18 @@ def upsert_source_file_map(conn: sqlite3.Connection, prefix: str, label: str,
 
 
 def get_source_row(conn: sqlite3.Connection, prefix: str) -> sqlite3.Row | None:
-    """Full source_file_map row for a prefix, including continuity columns."""
+    """Full source_file_map row for a prefix (case-insensitive lookup)."""
     return conn.execute(
-        "SELECT * FROM source_file_map WHERE source_prefix = ?", (prefix,)
+        "SELECT * FROM source_file_map WHERE source_prefix = ? COLLATE NOCASE",
+        (prefix,),
     ).fetchone()
 
 
 def get_account_type(conn: sqlite3.Connection, prefix: str) -> str | None:
+    """Case-insensitive lookup of account_type by prefix."""
     row = conn.execute(
-        "SELECT account_type FROM source_file_map WHERE source_prefix = ?", (prefix,)
+        "SELECT account_type FROM source_file_map WHERE source_prefix = ? COLLATE NOCASE",
+        (prefix,),
     ).fetchone()
     return row["account_type"] if row else None
 
@@ -125,8 +130,10 @@ def get_active_sources(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 # ---------------------------------------------------------------------------
 
 def get_column_template(conn: sqlite3.Connection, prefix: str) -> sqlite3.Row | None:
+    """Case-insensitive lookup of the column_template for a prefix."""
     return conn.execute(
-        "SELECT * FROM column_templates WHERE source_prefix = ?", (prefix,)
+        "SELECT * FROM column_templates WHERE source_prefix = ? COLLATE NOCASE",
+        (prefix,),
     ).fetchone()
 
 

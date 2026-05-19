@@ -412,9 +412,12 @@ def check_cross_source_completeness(conn: sqlite3.Connection,
     Discontinued accounts are filtered out — they're expected to be absent.
     """
     history = queries.get_sources_seen_in_history(conn)
+    # Case-insensitive comparison: build a lowercased set of current prefixes
+    # so file names like "VENMO" still match the source_file_map entry "Venmo".
+    current_lower = {p.lower() for p in current_prefixes}
     missing = []
     for prefix, last_end in history.items():
-        if prefix in current_prefixes:
+        if prefix.lower() in current_lower:
             continue
         src_row = queries.get_source_row(conn, prefix)
         if not src_row:
@@ -423,7 +426,7 @@ def check_cross_source_completeness(conn: sqlite3.Connection,
         # already showing up in the current input.
         if src_row["discontinued_since"]:
             continue
-        if src_row["replaced_by_prefix"] and src_row["replaced_by_prefix"] in current_prefixes:
+        if src_row["replaced_by_prefix"] and src_row["replaced_by_prefix"].lower() in current_lower:
             continue
         missing.append({
             "prefix": prefix,

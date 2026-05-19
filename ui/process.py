@@ -357,7 +357,13 @@ def _show_routing_summary(routing: dict):
             for fname in routing["ingest"]:
                 st.write(f"  - `{fname}`")
     if routing["unparseable"]:
-        st.error("These files don't match the naming pattern:")
+        st.error(
+            "These files don't match the naming pattern. "
+            "Expected format: **`<prefix> MM-DD-YYYY to MM-DD-YYYY.csv`** "
+            "(month, day, and **4-digit year**, separated by hyphens). "
+            "Examples: `Chase5616 04-01-2026 to 04-30-2026.csv`, "
+            "`Venmo 03-01-2026 to 03-31-2026.csv`."
+        )
         for fname in routing["unparseable"]:
             st.write(f"  - `{fname}`")
 
