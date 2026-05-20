@@ -6,6 +6,23 @@ from decimal import Decimal
 from pathlib import Path
 
 
+# SQL fragment selecting rows that are NOT split parents — i.e. rows that
+# should be counted in totals. A split parent is any transaction referenced by
+# another row's split_parent_id; its dollars are represented by its legs
+# instead, so counting both would double-count. Reuse this everywhere a total
+# is computed (reports, checksums, banners) so the books stay balanced.
+NOT_PARENT_SQL = (
+    "id NOT IN (SELECT split_parent_id FROM transactions "
+    "WHERE split_parent_id IS NOT NULL)"
+)
+
+
+def _cents(value) -> Decimal:
+    """Quantize any amount to cents. SQLite stores amount as REAL, so sums can
+    carry float noise; comparing at cent precision is the correct test."""
+    return Decimal(str(value or 0)).quantize(Decimal("0.01"))
+
+
 # ---------------------------------------------------------------------------
 # Categories
 # ---------------------------------------------------------------------------
@@ -270,10 +287,18 @@ def get_pending_count(conn: sqlite3.Connection) -> int:
 def get_transactions(conn: sqlite3.Connection, start_date: str | None = None,
                      end_date: str | None = None, source: str | None = None,
                      search: str | None = None, search_payee: str | None = None,
-                     status: str | None = None) -> list[sqlite3.Row]:
-    """Flexible transaction query with optional filters."""
+                     status: str | None = None,
+                     exclude_parents: bool = False) -> list[sqlite3.Row]:
+    """Flexible transaction query with optional filters.
+
+    exclude_parents=True drops split-parent rows (their legs carry the dollars),
+    so the result totals correctly. Leave it False for editing/browsing views
+    that need to display parents.
+    """
     clauses = []
     params = []
+    if exclude_parents:
+        clauses.append(NOT_PARENT_SQL)
     if start_date:
         clauses.append("date >= ?")
         params.append(start_date)
@@ -329,6 +354,179 @@ def check_duplicate_rows(conn: sqlite3.Connection, date: str, source: str,
         (date, source, amount, description_raw),
     ).fetchone()
     return row["cnt"] > 0
+
+
+def get_transaction(conn: sqlite3.Connection, txn_id: int) -> sqlite3.Row | None:
+    """Fetch a single transaction by id."""
+    return conn.execute(
+        "SELECT * FROM transactions WHERE id = ?", (txn_id,)
+    ).fetchone()
+
+
+# ---------------------------------------------------------------------------
+# Transaction splitting
+#
+# A "split" breaks one ingested transaction into several legs, each separately
+# categorizable. The original (parent) row is never modified — it stays so that
+# re-ingest dedup and bank-statement comparison keep matching. Each leg is a
+# new row whose split_parent_id points at the parent. Parent-ness is derived
+# from those references (see NOT_PARENT_SQL), never stored as a flag.
+# ---------------------------------------------------------------------------
+
+MAX_SPLIT_LEGS = 10
+
+
+def get_parent_ids(conn: sqlite3.Connection) -> set[int]:
+    """Set of transaction ids that have at least one split leg (i.e. parents)."""
+    rows = conn.execute(
+        "SELECT DISTINCT split_parent_id FROM transactions "
+        "WHERE split_parent_id IS NOT NULL"
+    ).fetchall()
+    return {r["split_parent_id"] for r in rows}
+
+
+def get_split_children(conn: sqlite3.Connection, parent_id: int) -> list[sqlite3.Row]:
+    """All legs of a split, oldest-id first (creation order)."""
+    return conn.execute(
+        "SELECT * FROM transactions WHERE split_parent_id = ? ORDER BY id",
+        (parent_id,),
+    ).fetchall()
+
+
+def split_role(conn: sqlite3.Connection, txn_id: int) -> str:
+    """Return '', 'parent', or 'leg' for a transaction id."""
+    row = get_transaction(conn, txn_id)
+    if row is None:
+        return ""
+    if row["split_parent_id"] is not None:
+        return "leg"
+    if conn.execute(
+        "SELECT 1 FROM transactions WHERE split_parent_id = ? LIMIT 1", (txn_id,)
+    ).fetchone():
+        return "parent"
+    return ""
+
+
+def replace_split_legs(conn: sqlite3.Connection, parent_id: int,
+                       legs: list[dict], status: str = "confirmed") -> None:
+    """Create or replace the legs of a split atomically.
+
+    `legs` is a list of dicts; each may carry amount, category, subcategory,
+    payee, payor, tax_flags, check_number, note. Legs inherit the parent's
+    date, source and description_raw. Raises ValueError if there are not
+    between 2 and MAX_SPLIT_LEGS legs, or if their amounts don't sum (to the
+    cent) to the parent's amount.
+    """
+    parent = get_transaction(conn, parent_id)
+    if parent is None:
+        raise ValueError(f"Transaction {parent_id} not found.")
+    if parent["split_parent_id"] is not None:
+        raise ValueError("Cannot split a row that is itself a split leg.")
+
+    if not (2 <= len(legs) <= MAX_SPLIT_LEGS):
+        raise ValueError(
+            f"A split needs between 2 and {MAX_SPLIT_LEGS} legs; got {len(legs)}."
+        )
+
+    legs_total = sum(_cents(leg.get("amount")) for leg in legs)
+    if legs_total != _cents(parent["amount"]):
+        raise ValueError(
+            f"Legs total {legs_total} does not equal parent amount "
+            f"{_cents(parent['amount'])} (off by "
+            f"{_cents(parent['amount']) - legs_total})."
+        )
+
+    rows = []
+    for leg in legs:
+        rows.append({
+            "date": parent["date"],
+            "amount": str(_cents(leg.get("amount"))),
+            "check_number": leg.get("check_number") or None,
+            "description_raw": parent["description_raw"],
+            "category_raw": None,
+            "payee": leg.get("payee") or None,
+            "via": None,
+            "payor": leg.get("payor") or None,
+            "category": leg.get("category") or None,
+            "subcategory": leg.get("subcategory") or None,
+            "tax_flags": leg.get("tax_flags") or None,
+            "note": leg.get("note") or None,
+            "order_ref": None,
+            "source": parent["source"],
+            "status": status,
+            "overridden": 1,
+            "split_parent_id": parent_id,
+        })
+
+    # Replace any existing legs in one transaction so a split is never partial.
+    conn.execute("DELETE FROM transactions WHERE split_parent_id = ?", (parent_id,))
+    conn.executemany(
+        "INSERT INTO transactions "
+        "(date, amount, check_number, description_raw, category_raw, payee, via, "
+        "payor, category, subcategory, tax_flags, note, order_ref, source, "
+        "status, overridden, split_parent_id) "
+        "VALUES (:date, :amount, :check_number, :description_raw, :category_raw, "
+        ":payee, :via, :payor, :category, :subcategory, :tax_flags, :note, "
+        ":order_ref, :source, :status, :overridden, :split_parent_id)",
+        rows,
+    )
+    conn.execute(
+        "INSERT INTO db_audit_log (action, detail) VALUES (?, ?)",
+        ("SPLIT_TRANSACTION",
+         f"parent={parent_id} legs={len(rows)} total={legs_total}"),
+    )
+    conn.commit()
+
+
+def unsplit_transaction(conn: sqlite3.Connection, parent_id: int) -> int:
+    """Delete all legs of a split, returning the parent to a normal row.
+
+    Returns the number of legs removed. Atomic — you can never be left half-split.
+    """
+    cur = conn.execute(
+        "DELETE FROM transactions WHERE split_parent_id = ?", (parent_id,)
+    )
+    conn.execute(
+        "INSERT INTO db_audit_log (action, detail) VALUES (?, ?)",
+        ("UNSPLIT_TRANSACTION", f"parent={parent_id} legs_removed={cur.rowcount}"),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def check_split_integrity(conn: sqlite3.Connection) -> list[dict]:
+    """Per-split balance check: for each parent, sum(legs) must equal the parent.
+
+    Returns one dict per UNBALANCED split (empty list means all splits balance).
+    A per-split check is essential — a global parents-vs-legs total could net to
+    zero while individual splits are wrong in opposite directions.
+    """
+    parents = conn.execute(
+        "SELECT p.id, p.date, p.source, p.amount AS parent_amount, "
+        "       p.description_raw, "
+        "       COALESCE(SUM(c.amount), 0) AS legs_total, "
+        "       COUNT(c.id) AS leg_count "
+        "FROM transactions p "
+        "JOIN transactions c ON c.split_parent_id = p.id "
+        "GROUP BY p.id ORDER BY p.date"
+    ).fetchall()
+    broken = []
+    for p in parents:
+        parent_amt = _cents(p["parent_amount"])
+        legs_total = _cents(p["legs_total"])
+        diff = parent_amt - legs_total
+        if diff != 0:
+            broken.append({
+                "id": p["id"],
+                "date": p["date"],
+                "source": p["source"],
+                "description_raw": p["description_raw"],
+                "parent_amount": parent_amt,
+                "legs_total": legs_total,
+                "difference": diff,
+                "leg_count": p["leg_count"],
+            })
+    return broken
 
 
 def purge_transactions(conn: sqlite3.Connection) -> int:

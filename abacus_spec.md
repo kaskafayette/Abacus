@@ -41,6 +41,7 @@ Stores all processed transactions. One row per transaction.
 | `source` | TEXT | Account label from `source_file_map` (e.g. "Chase5616", "Chase7625-4669") |
 | `status` | TEXT | `"pending"` = imported but not fully confirmed; `"confirmed"` = all fields resolved; `"needs_review"` = user flagged for follow-up |
 | `overridden` | BOOLEAN | True if any field was manually edited |
+| `split_parent_id` | INTEGER | NULL for normal rows. When set, this row is a **leg** of a split, pointing at the original (parent) transaction's `id`. See [Transaction Splitting](#transaction-splitting). |
 
 ---
 
@@ -339,7 +340,7 @@ All reports saved to `output/`.
 
 ## Maintenance
 
-Seven tabs. All editable tables use AG Grid with single-click inline editing and dropdown selectors.
+Nine tabs. All editable tables use AG Grid with single-click inline editing and dropdown selectors.
 
 ### Source Accounts
 - AG Grid: prefix, label (read-only), nickname and account_type (editable, dropdown for type)
@@ -368,10 +369,49 @@ Seven tabs. All editable tables use AG Grid with single-click inline editing and
 - Search, date range, source, and status filters
 - AG Grid with pagination: payee, category (dropdown), subcategory, tax flags, payor (dropdown), note, status (dropdown) - all editable inline
 - Save Changes button updates all edited rows
+- **Split rows are fenced off for inline editing.** Any row that is a split parent or leg renders greyed/italic with a `Split` marker and its editable cells are locked (AG Grid per-row `editable` callback). Save skips them.
+- **Split from here.** A far-left checkbox selects one row; the **Split this transaction** button opens the split editor inline below the grid (same editor as the Split Transaction tab). This is the primary entry point, because the grid's filters can locate any row by date/source/status/search when the Split tab's text search can't.
+
+### Split Transaction
+- Breaks one transaction into 2–10 separately-categorized legs (see [Transaction Splitting](#transaction-splitting)). The editor is shared with the Edit Transactions "Split" action.
+- A health expander lists all existing splits and flags any that don't balance.
+- Text search → pick a transaction (a leg resolves to its parent). The parent is shown read-only; legs are edited in an AG Grid (amount, category, subcategory, payee, payor, check #, note) with **Add leg / Remove leg** buttons. Subcategory cascades from the chosen category, same as the Categorize tab; tax flags default from the category on save.
+- Leg amounts are entered **as-is** (a deposit's legs stay positive); the system does not touch the sign — it just checks the legs sum to the original.
+- Live remainder = parent − Σ(legs); **Create/Update is disabled until the remainder is $0.00** and there are 2–10 legs. Legs are saved as `confirmed`. The original parent row is **never written** — splitting only inserts/replaces leg rows.
+- **Unsplit** removes all legs atomically, returning the parent to a normal row.
+
+### Pending Folder
+- Lists enrichment files (Venmo/Amazon) awaiting full match; manual "move stale files to processed/" cleanup tool (default 180 days). Nothing moves automatically.
 
 ### Database
 - File path, size, record counts per table
 - **Purge Transaction Data** - deletes all transactions, preserves lookup tables, requires typing "DELETE ALL TRANSACTIONS" to confirm, logged to audit log
+
+---
+
+## Transaction Splitting
+
+Some single ingested transactions are really several things — e.g. a teller deposit that lumped two checks into one line, or a payment that needs to land in two categories. Splitting breaks one transaction into multiple **legs**, each independently categorized, without disturbing the books.
+
+### Model
+- A **leg** is a new row whose `split_parent_id` points at the original transaction's `id`. Legs inherit the parent's `date`, `source`, and `description_raw`; each carries its own amount, category, payee, payor, check #, note. Legs are created `confirmed`, `overridden=1`.
+- The **parent** is any row referenced by a leg. **It is never modified** — so it still matches the bank statement and survives re-ingest (dedup keys on date+source+amount+description, so the unchanged parent is skipped on re-import).
+- "Parent" and "leg" are **derived**, never stored as a flag: a parent is "a row some leg points at," computed on demand. This can't fall out of sync (e.g. unsplitting just deletes the legs and the parent is automatically normal again).
+
+### Counting rule
+- Legs must sum **exactly** (to the cent) to the parent. Enforced on every save; an unbalanced split cannot be saved.
+- Everywhere a total is computed, **split parents are excluded** (`queries.NOT_PARENT_SQL`) and their legs are counted instead. Applied in: report body fetch, the page-1 checksum DB-side queries, the missing-payee and unfinalized banners, and the Excel export. Because legs sum to the parent, the grand total is unchanged — the line is just redistributed.
+
+### Integrity
+- The page-1 checksum MATCH (report-total vs DB-total) **cannot** detect a damaged split, because both sides exclude parents — a missing/edited leg understates both equally and still reads OK.
+- A separate **per-split integrity check** (`queries.check_split_integrity`) verifies each parent independently and is surfaced (a) as a "Split Integrity" block on report page 1, and (b) as a health expander in the Split Transaction tab. A *global* parents-vs-legs comparison is intentionally avoided — two splits wrong in opposite directions would net to zero and hide both.
+- Legs can only be created/edited/removed through the Split Transaction tab (amounts locked everywhere else), so the only way to change a split is the balance-enforced editor or an atomic unsplit. There is no way to delete a single leg and leave a split half-broken through the UI.
+
+### Browse / dump
+- Browse mirrors the reports: **split parents are excluded** (`exclude_parents=True`) and the legs are shown, tagged `leg` in a `Split` column. A parent's stale pre-split category therefore can't surface it in a search. Edit Transactions is the one place the parent stays visible (greyed/locked) so it can be managed/unsplit.
+
+### Not part of ingest
+Splits are after-the-fact cleanup, discovered when reconciling — they are never created during the normal ingest run.
 
 ---
 
@@ -570,6 +610,8 @@ Concrete work that's queued and committed — has a clear path, just hasn't been
 8. **Auto-apply mode for enrichments.** Right now, every enrichment run requires you to click "Apply Enrichments" after reviewing the proposed payee/category patches — a manual confirmation step. The original plan was to flip this to fully automatic once you've used the manual flow long enough to trust it. Hold off until at least a few months of clean enrichment runs, then revisit.
 9. **Collapsible Instructions box on every page.** Right now usage instructions live in separate `.docx` files (`INSTRUCTIONS Abacus.docx`, `processing flow for venmo and amazon.docx`, etc.) that the user has to flip to. Goal: put a collapsible "Instructions" panel at the top of each page — Ingest, Normalize & Categorize, Reports, Maintenance — that summarizes what that page does and how to walk through it. Default closed so it doesn't clutter the screen, but always one click away. The Ingest page already has the start of this; extend the pattern to the others.
 10. **Audit the UI for sharp objects.** Sweep every page in the app for actions that can destroy or overwrite user work, and put each one behind a confirmation barrier. Known examples already guarded: Purge Transaction Data (typed phrase), Re-run All Normalization (typed phrase). Suspect candidates that may not have guards: Delete Selected on the various Maintenance tabs (payee_normalization, payee_metadata, categories), the Reset Venmo Rows button, anything that bulk-clears state. Pattern to apply: either a two-click confirm (red button on second click) or a typed-phrase like the Purge example. Goal is that no single accidental click loses work.
+11. **Browse: also show the split-parent row, greyed out.** Browse currently excludes split parents entirely (they were causing stale-category search hits). But that means if you pick up a bank statement or other source document and search Browse for the original line — by its amount, description, or the "Deposit" payee — you'll come up empty and might think the transaction was never recorded. Fix: bring the parent back into Browse but render it greyed/italic and tagged `split — not counted` (exactly like the Edit Transactions grid already does), and keep it out of the Money In/Out totals. The earlier stale-category problem is then handled separately by #12 (or by ignoring the parent's category in Browse search). Net effect: a statement search finds the original, sees it's been split, and the legs show the real breakdown.
+12. **Numeric search in Browse and Edit Transactions.** The "Search Anywhere" box currently matches only text columns (payee, description, note, category, etc.), not the numeric `amount` or `id`. So you can't type `4600.65` to find every transaction of that amount, which is the natural thing to do when reconciling against a statement. Extend the search so a numeric term also matches `amount` (and probably `id`) — e.g. `4600.65` finds all rows with that amount regardless of sign, and `#789`/`789` finds that transaction id. Applies to both the Browse search box and the Edit Transactions search box (they share `queries.get_transactions`).
 
 ---
 
@@ -577,7 +619,7 @@ Concrete work that's queued and committed — has a clear path, just hasn't been
 
 Items that would be nice to have but aren't currently planned. Re-evaluate when one becomes painful enough to upgrade.
 
-1. **Transaction splitting.** Today a transaction has exactly one category. Splitting would let a single row be broken into multiple sub-rows with different categories — useful for things like a restaurant bill that's part personal and part reimbursable business meal, or a grocery run that includes household supplies and prescriptions on the same receipt. The Amazon item-level learning in Next Steps #3 covers the most common case (Amazon orders spanning categories), so general splitting is less urgent than it would otherwise be.
+1. **Transaction splitting.** ✅ **Implemented** — see the [Transaction Splitting](#transaction-splitting) section. A row can now be broken into multiple separately-categorized legs (teller deposit of two checks, a charge that's part personal and part reimbursable, etc.) via Edit Transactions → Split or the Split Transaction tab. Open follow-ups are Next Steps #11 (show the parent in Browse) and #12 (numeric search). Amazon item-level learning (Next Steps #3) remains the path for per-item Amazon breakdowns.
 2. **Manual "Add Transaction" form.** A way to add a brand-new transaction by hand, not derived from any ingested file. The use case is money that flowed outside a tracked account — e.g. the Venmo-balance portion of split-funded charges, or any Wells Fargo-funded Venmo payment. Today you can only edit transactions that exist; this would add the ability to create one. Not a priority because the upstream fix (turning on Venmo auto-transfer and making Chase the default funding source) closes most of the gap before it ever reaches Abacus.
 3. **Zelle detail import.** Same idea as the Venmo enricher: import a per-transaction detail file from Zelle so Chase's vague "Online Payment To X" rows get filled in with the real recipient and any memo. Blocked because Zelle doesn't currently offer a usable export. If/when they add one, the existing enrichment framework can absorb it as a new parser registration.
 4. **Payor reporting.** A new report (or report section) showing spending by category broken out by payor — i.e. how much David spent vs. how much Debra spent vs. shared expenses. The payor field already exists on every transaction; this is purely a reporting addition. Useful for household-budget conversations and for understanding who's contributing what to which categories.

@@ -3,6 +3,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import date
+from decimal import Decimal
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 
 from db import queries
@@ -15,7 +16,7 @@ def maintenance_page(conn):
     tabs = st.tabs([
         "Source Accounts", "Payee Normalization", "Payee Metadata",
         "Category Master", "Rename / Merge Payees", "Edit Transactions",
-        "Pending Folder", "Database",
+        "Split Transaction", "Pending Folder", "Database",
     ])
 
     with tabs[0]:
@@ -31,8 +32,10 @@ def maintenance_page(conn):
     with tabs[5]:
         _edit_transactions(conn)
     with tabs[6]:
-        _pending_folder(conn)
+        _split_transaction(conn)
     with tabs[7]:
+        _pending_folder(conn)
+    with tabs[8]:
         _database_admin(conn)
 
 
@@ -686,9 +689,24 @@ def _edit_transactions(conn):
     payor_options = ["", "David", "Debra", "Both", "Unknown"]
     status_options = ["pending", "confirmed", "needs_review"]
 
+    # Derive each row's split role so split rows can be visually fenced off and
+    # locked from inline edits. Editing a split must happen in the Split
+    # Transaction tab, where the leg/parent relationship is enforced.
+    parent_ids = queries.get_parent_ids(conn)
+
+    def _role(r):
+        if r["split_parent_id"] is not None:
+            return "leg"
+        if r["id"] in parent_ids:
+            return "parent"
+        return ""
+
+    role_labels = {"": "", "parent": "split (not counted)", "leg": "leg"}
+
     # Build editable grid
     data = []
     for r in rows:
+        role = _role(r)
         data.append({
             "id": r["id"],
             "Date": r["date"],
@@ -702,21 +720,48 @@ def _edit_transactions(conn):
             "Note": r["note"] or "",
             "Status": r["status"],
             "Description": r["description_raw"],
+            "Split": role_labels[role],
+            "split_role": role,
         })
 
     df = pd.DataFrame(data)
 
+    n_split = sum(1 for d in data if d["split_role"])
+    if n_split:
+        st.info(
+            f"{n_split} row(s) here are part of a split (greyed, locked). "
+            "Edit them in the **Split Transaction** tab — the leg amounts must "
+            "stay balanced against the parent, so they can't be edited inline.",
+            icon="🔒",
+        )
+
+    # A cell is editable only when the row is NOT part of a split. AG Grid
+    # accepts a function for `editable`, so split legs/parents are locked
+    # automatically — the inline editor simply won't open on them.
+    not_split_editable = JsCode(
+        "function(params){ return !params.data.split_role; }"
+    )
+    # Grey + italicize split rows so they read as fenced-off.
+    split_row_style = JsCode(
+        "function(params){ if (params.data && params.data.split_role) "
+        "{ return {'color': '#888', 'fontStyle': 'italic'}; } return null; }"
+    )
+
     gb = GridOptionsBuilder.from_dataframe(df)
     gb.configure_default_column(resizable=True, sortable=True, editable=False)
-    gb.configure_grid_options(singleClickEdit=True, stopEditingWhenCellsLoseFocus=True)
+    gb.configure_grid_options(singleClickEdit=True,
+                              stopEditingWhenCellsLoseFocus=True,
+                              getRowStyle=split_row_style)
     gb.configure_column("id", width=50)
+    gb.configure_column("split_role", hide=True)
     gb.configure_column("Date", width=95)
     gb.configure_column("Source", width=110)
-    gb.configure_column("Payee", editable=True, width=150)
-    gb.configure_column("Category", editable=True, width=140,
+    gb.configure_column("Split", width=110)
+    gb.configure_column("Payee", editable=not_split_editable, width=150)
+    gb.configure_column("Category", editable=not_split_editable, width=140,
                         cellEditor="agSelectCellEditor",
                         cellEditorParams={"values": [""] + category_names})
-    gb.configure_column("Subcategory", editable=True, width=140)
+    gb.configure_column("Subcategory", editable=not_split_editable, width=140)
     from ui._amount_style import amount_cell_style, amount_value_formatter
     gb.configure_column("Amount", width=90,
                         type=["numericColumn"],
@@ -728,25 +773,27 @@ def _edit_transactions(conn):
         "Business Expense, Reimbursable",
         "Business Expense, Home Office",
     ]
-    gb.configure_column("Tax Flags", editable=True, width=160,
+    gb.configure_column("Tax Flags", editable=not_split_editable, width=160,
                         cellEditor="agSelectCellEditor",
                         cellEditorParams={"values": tax_flag_values})
-    gb.configure_column("Payor", editable=True, width=90,
+    gb.configure_column("Payor", editable=not_split_editable, width=90,
                         cellEditor="agSelectCellEditor",
                         cellEditorParams={"values": payor_options})
-    gb.configure_column("Note", editable=True, width=150)
-    gb.configure_column("Status", editable=True, width=100,
+    gb.configure_column("Note", editable=not_split_editable, width=150)
+    gb.configure_column("Status", editable=not_split_editable, width=100,
                         cellEditor="agSelectCellEditor",
                         cellEditorParams={"values": status_options})
     gb.configure_column("Description", width=200)
 
     # Paginate
     gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=50)
+    # Far-left checkbox to pick one row to split.
+    gb.configure_selection(selection_mode="single", use_checkbox=True)
 
     grid_response = AgGrid(
         df,
         gridOptions=gb.build(),
-        update_mode=GridUpdateMode.VALUE_CHANGED,
+        update_mode=GridUpdateMode.MODEL_CHANGED,
         fit_columns_on_grid_load=True,
         height=500,
         allow_unsafe_jscode=True,
@@ -754,7 +801,13 @@ def _edit_transactions(conn):
 
     if st.button("Save Changes", key="save_txns"):
         edited = grid_response["data"]
+        skipped = 0
         for _, row in edited.iterrows():
+            # Never write split parents or legs from this grid — they're edited
+            # only in the Split Transaction tab, with the balance enforced.
+            if row.get("split_role"):
+                skipped += 1
+                continue
             queries.update_transaction(
                 conn, int(row["id"]),
                 payee=row["Payee"] or None,
@@ -766,8 +819,383 @@ def _edit_transactions(conn):
                 status=row["Status"],
                 overridden=1,
             )
-        st.success("Saved.")
+        msg = "Saved."
+        if skipped:
+            msg += f" ({skipped} split row(s) left untouched — edit below or in Split Transaction.)"
+        st.success(msg)
         st.rerun()
+
+    # --- Split the selected transaction ---
+    # Splitting needs the full filter power of this grid to find a row by amount
+    # or id, so it's driven from here: tick a row, click Split, edit below.
+    sel = grid_response.get("selected_rows")
+    if sel is not None and len(sel) > 0:
+        srow = sel.iloc[0]
+        st.session_state["edit_selected_id"] = int(srow["id"])
+        st.session_state["edit_selected_label"] = (
+            f"#{int(srow['id'])} · {srow['Date']} · {srow['Source']} · "
+            f"{srow['Payee'] or srow['Description']}"
+        )
+
+    st.divider()
+    selected_id = st.session_state.get("edit_selected_id")
+    if not selected_id:
+        st.caption("Tick a row's checkbox (far left), then click Split to break "
+                   "it into separately-categorized legs.")
+    else:
+        st.markdown(f"**Selected:** {st.session_state.get('edit_selected_label', '')}")
+        if st.button("Split this transaction ↓", key="edit_split_btn"):
+            st.session_state["edit_split_id"] = selected_id
+            st.rerun()
+
+    if st.session_state.get("edit_split_id"):
+        st.divider()
+        col_h, col_x = st.columns([4, 1])
+        col_h.subheader("Split editor")
+        if col_x.button("Close", key="edit_split_close"):
+            st.session_state.pop("edit_split_id", None)
+            st.rerun()
+        _render_split_editor(conn, st.session_state["edit_split_id"],
+                             key_prefix="editsplit")
+
+
+# ---------------------------------------------------------------------------
+# Split Transaction
+# ---------------------------------------------------------------------------
+
+def _split_cell(v):
+    """Normalize a grid cell to a clean str or None."""
+    if v is None:
+        return None
+    if isinstance(v, float) and pd.isna(v):
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _build_subcats_map(conn):
+    """Return ({category: [subcategories]}, {(cat, subcat): tax_flag_default})."""
+    subcats_map: dict[str, list[str]] = {}
+    tax_defaults: dict[tuple, str] = {}
+    for cat in queries.get_categories(conn):
+        c, sc = cat["category"], cat["subcategory"]
+        subcats_map.setdefault(c, [""])
+        if sc:
+            subcats_map[c].append(sc)
+        if cat["tax_flag_default"]:
+            tax_defaults[(c, sc)] = cat["tax_flag_default"]
+    return subcats_map, tax_defaults
+
+
+def _resolve_leg_tax_flags(tax_defaults, cat, subcat):
+    """Default tax flag for a (category, subcategory), mirroring the Categorize tab."""
+    if not cat:
+        return None
+    key = (cat, subcat if subcat else None)
+    if key in tax_defaults:
+        return tax_defaults[key]
+    if (cat, None) in tax_defaults:
+        return tax_defaults[(cat, None)]
+    return None
+
+
+_SPLIT_COLS = ["Amount", "Category", "Subcategory", "Payee", "Payor", "Check #", "Note"]
+
+
+def _blank_leg_row():
+    return {c: (None if c == "Amount" else "") for c in _SPLIT_COLS}
+
+
+def _render_split_editor(conn, txn_id, key_prefix="split"):
+    """Parent summary + legs editor + Create/Update/Unsplit for one split.
+
+    `txn_id` may be a normal row (create a split), a split parent (edit), or a
+    leg (resolves to its parent). Shared by the Split Transaction tab and the
+    Edit Transactions "Split selected" action; `key_prefix` keeps widget keys
+    distinct between the two call sites.
+
+    Leg amounts are entered exactly as-is (the original keeps its sign); the only
+    rule is that the legs must sum to the original amount.
+    """
+    import json
+    from ui._amount_style import format_signed_amount
+
+    category_names = queries.get_category_names(conn)
+    payor_options = ["", "David", "Debra", "Both", "Unknown"]
+    subcats_map, tax_defaults = _build_subcats_map(conn)
+
+    parent = queries.get_transaction(conn, txn_id)
+    if parent is None:
+        st.error("Transaction not found.")
+        return
+    if parent["split_parent_id"] is not None:
+        parent = queries.get_transaction(conn, parent["split_parent_id"])
+    parent_id = parent["id"]
+
+    existing_legs = queries.get_split_children(conn, parent_id)
+    is_split = len(existing_legs) > 0
+    parent_amt = Decimal(str(parent["amount"])).quantize(Decimal("0.01"))
+
+    st.markdown(
+        f"**Original (parent):** #{parent['id']} · {parent['date']} · "
+        f"{parent['source']} · {format_signed_amount(float(parent_amt))} · "
+        f"{parent['description_raw']}"
+    )
+    st.caption(
+        f"Already split into {len(existing_legs)} leg(s) — edit below."
+        if is_split else
+        "Not split yet. Enter each leg's amount as-is (a deposit stays positive); "
+        "the legs just have to sum to the original. Pick a Category and the "
+        "Subcategory list narrows to that category."
+    )
+
+    # Working rows live in session_state so edits + add/remove survive reruns.
+    state_key = f"{key_prefix}_legs_{parent_id}"
+    if state_key not in st.session_state:
+        if is_split:
+            st.session_state[state_key] = [{
+                "Amount": float(Decimal(str(l["amount"]))),
+                "Category": l["category"] or "",
+                "Subcategory": l["subcategory"] or "",
+                "Payee": l["payee"] or "",
+                "Payor": l["payor"] or "",
+                "Check #": l["check_number"] or "",
+                "Note": l["note"] or "",
+            } for l in existing_legs]
+        else:
+            st.session_state[state_key] = [_blank_leg_row(), _blank_leg_row()]
+
+    legs_rows = st.session_state[state_key]
+
+    col_add, col_rm, _ = st.columns([1, 1, 4])
+    if col_add.button("➕ Add leg", key=f"{key_prefix}_add_{parent_id}",
+                      disabled=len(legs_rows) >= queries.MAX_SPLIT_LEGS):
+        legs_rows.append(_blank_leg_row())
+        st.session_state[state_key] = legs_rows
+        st.rerun()
+    if col_rm.button("➖ Remove leg", key=f"{key_prefix}_rm_{parent_id}",
+                     disabled=len(legs_rows) <= 2):
+        legs_rows.pop()
+        st.session_state[state_key] = legs_rows
+        st.rerun()
+
+    df = pd.DataFrame(legs_rows, columns=_SPLIT_COLS)
+
+    # Subcategory dropdown narrows to the row's selected Category (same cascade
+    # as the Categorize tab).
+    subcat_editor = JsCode(
+        "function(params){ var m=" + json.dumps(subcats_map) + ";"
+        " var c=params.data.Category;"
+        " if(c && m[c]){ return {values: m[c]}; } return {values: ['']}; }"
+    )
+    from ui._amount_style import amount_cell_style, amount_value_formatter
+    gb = GridOptionsBuilder.from_dataframe(df)
+    gb.configure_default_column(resizable=True, editable=True)
+    gb.configure_grid_options(singleClickEdit=True, stopEditingWhenCellsLoseFocus=True)
+    gb.configure_column("Amount", width=110, type=["numericColumn"],
+                        valueFormatter=amount_value_formatter(),
+                        cellStyle=amount_cell_style())
+    gb.configure_column("Category", width=160, cellEditor="agSelectCellEditor",
+                        cellEditorParams={"values": [""] + category_names})
+    gb.configure_column("Subcategory", width=180, cellEditor="agSelectCellEditor",
+                        cellEditorParams=subcat_editor)
+    gb.configure_column("Payee", width=160)
+    gb.configure_column("Payor", width=100, cellEditor="agSelectCellEditor",
+                        cellEditorParams={"values": payor_options})
+    gb.configure_column("Check #", width=100)
+    gb.configure_column("Note", width=170)
+
+    resp = AgGrid(
+        df,
+        gridOptions=gb.build(),
+        update_mode=GridUpdateMode.VALUE_CHANGED,
+        allow_unsafe_jscode=True,
+        fit_columns_on_grid_load=True,
+        height=80 + 30 * len(df),
+        # key includes row count so add/remove rebuilds; stable during edits.
+        key=f"{key_prefix}_grid_{parent_id}_{len(df)}",
+    )
+    # Persist edits back so they survive the next rerun (add/remove, etc.)
+    edited_records = resp["data"].to_dict("records")
+    st.session_state[state_key] = edited_records
+
+    # Live balance check — legs are summed exactly as entered (we don't touch
+    # the sign) and must equal the original amount.
+    legs_sum = Decimal("0.00")
+    parsed = []
+    for rec in edited_records:
+        amt = rec.get("Amount")
+        if amt is None or amt == "" or (isinstance(amt, float) and pd.isna(amt)):
+            continue
+        try:
+            val = Decimal(str(amt)).quantize(Decimal("0.01"))
+        except Exception:
+            continue
+        legs_sum += val
+        parsed.append((rec, val))
+    n_legs = len(parsed)
+    remainder = parent_amt - legs_sum
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Parent amount", format_signed_amount(float(parent_amt)))
+    c2.metric("Legs total", format_signed_amount(float(legs_sum)))
+    c3.metric("Remainder", format_signed_amount(float(remainder)))
+
+    balanced = (remainder == 0)
+    count_ok = (2 <= n_legs <= queries.MAX_SPLIT_LEGS)
+    if not count_ok:
+        st.warning(
+            f"A split needs between 2 and {queries.MAX_SPLIT_LEGS} legs "
+            f"with an amount (currently {n_legs})."
+        )
+    if balanced and count_ok:
+        st.success("Balanced — legs sum exactly to the parent.")
+    elif not balanced:
+        st.error(
+            f"Off by {format_signed_amount(float(remainder))}. "
+            "Adjust the leg amounts until the remainder is $0.00."
+        )
+
+    col_save, col_cancel, col_unsplit, _ = st.columns([1, 1, 1, 2])
+
+    if col_cancel.button("Cancel", key=f"{key_prefix}_cancel_{parent_id}"):
+        # Discard in-progress legs; close the inline editor when on the Edit page.
+        st.session_state.pop(state_key, None)
+        if key_prefix == "editsplit":
+            st.session_state.pop("edit_split_id", None)
+        st.rerun()
+
+    save_label = "Update split" if is_split else "Create split"
+    if col_save.button(save_label, type="primary",
+                       disabled=not (balanced and count_ok),
+                       key=f"{key_prefix}_save_{parent_id}"):
+        legs = []
+        for rec, val in parsed:
+            cat = _split_cell(rec.get("Category"))
+            subcat = _split_cell(rec.get("Subcategory"))
+            legs.append({
+                "amount": str(val),
+                "category": cat,
+                "subcategory": subcat,
+                "payee": _split_cell(rec.get("Payee")),
+                "payor": _split_cell(rec.get("Payor")),
+                "check_number": _split_cell(rec.get("Check #")),
+                "note": _split_cell(rec.get("Note")),
+                "tax_flags": _resolve_leg_tax_flags(tax_defaults, cat, subcat),
+            })
+        try:
+            queries.replace_split_legs(conn, parent_id, legs, status="confirmed")
+            st.session_state.pop(state_key, None)
+            st.success(f"{save_label}: {len(legs)} leg(s) saved (status: confirmed).")
+            st.rerun()
+        except ValueError as e:
+            st.error(str(e))
+
+    if is_split:
+        if col_unsplit.button("Unsplit (remove all legs)",
+                              key=f"{key_prefix}_unsplit_{parent_id}"):
+            removed = queries.unsplit_transaction(conn, parent_id)
+            st.session_state.pop(state_key, None)
+            st.success(
+                f"Removed {removed} leg(s). "
+                f"#{parent['id']} is a normal transaction again."
+            )
+            st.rerun()
+
+
+def _split_transaction(conn):
+    from ui._amount_style import format_signed_amount
+
+    st.subheader("Split Transaction")
+    st.caption(
+        "Break one transaction into several legs, each separately categorized — "
+        "e.g. a single teller deposit that was really two checks. The original "
+        "row is **never changed** (so it still matches your bank statement and "
+        "survives re-ingest) but it's excluded from report totals; the legs "
+        "carry the dollars and must sum **exactly** to it. Splits are for "
+        "after-the-fact cleanup — they aren't part of the normal ingest run."
+    )
+
+    # --- Health view: existing splits + integrity ---
+    parent_ids = queries.get_parent_ids(conn)
+    broken = queries.check_split_integrity(conn)
+    if parent_ids:
+        broken_ids = {b["id"] for b in broken}
+        title = f"Existing splits ({len(parent_ids)})"
+        title += f" — ⚠ {len(broken)} unbalanced" if broken else " — all balanced ✓"
+        with st.expander(title, expanded=bool(broken)):
+            ref = []
+            for pid in sorted(parent_ids):
+                p = queries.get_transaction(conn, pid)
+                legs = queries.get_split_children(conn, pid)
+                legs_sum = sum(Decimal(str(l["amount"])) for l in legs)
+                ref.append({
+                    "Parent ID": pid,
+                    "Date": p["date"],
+                    "Source": p["source"],
+                    "Description": (p["description_raw"] or "")[:50],
+                    "Parent": format_signed_amount(float(p["amount"])),
+                    "Legs": len(legs),
+                    "Legs total": format_signed_amount(float(legs_sum)),
+                    "Balanced": "—" if pid in broken_ids else "✓",
+                })
+            st.dataframe(pd.DataFrame(ref), use_container_width=True, hide_index=True)
+            if broken:
+                st.error(
+                    "Unbalanced splits understate your reports silently — the "
+                    "report MATCH checksum can't catch them. Open each one below "
+                    "and fix the legs (or unsplit)."
+                )
+
+    st.divider()
+
+    # --- Step 1: pick a transaction ---
+    search = st.text_input(
+        "Find the transaction to split / edit "
+        "(search payee, description, note, category, or source)",
+        key="split_search",
+    )
+    if not search:
+        st.info("Type a search above to find the transaction.")
+        return
+
+    rows = queries.get_transactions(conn, search=search)
+    if not rows:
+        st.info("No transactions match that search.")
+        return
+
+    # Build candidate options. A leg resolves to its parent for editing; each
+    # split appears once.
+    MAX_OPTS = 200
+    options: list[tuple[str, int]] = []
+    seen: set[int] = set()
+    for r in rows[:MAX_OPTS]:
+        if r["split_parent_id"] is not None:
+            target, role = r["split_parent_id"], "leg"
+        elif r["id"] in parent_ids:
+            target, role = r["id"], "split parent"
+        else:
+            target, role = r["id"], ""
+        if target in seen:
+            continue
+        seen.add(target)
+        p = queries.get_transaction(conn, target)
+        tag = f" [{role}]" if role else ""
+        label = (f"#{p['id']} | {p['date']} | {p['source']} | "
+                 f"{format_signed_amount(float(p['amount']))} | "
+                 f"{(p['payee'] or p['description_raw'] or '')[:40]}{tag}")
+        options.append((label, target))
+
+    if len(rows) > MAX_OPTS:
+        st.caption(f"Showing first {MAX_OPTS} of {len(rows)} matches — refine your search.")
+
+    choice = st.selectbox("Transaction", [o[0] for o in options], key="split_choice")
+    if not choice:
+        return
+    parent_id = dict(options)[choice]
+
+    st.divider()
+    _render_split_editor(conn, parent_id, key_prefix="splittab")
 
 
 # ---------------------------------------------------------------------------

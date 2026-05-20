@@ -10,6 +10,7 @@ import openpyxl
 from openpyxl.utils import get_column_letter
 
 from db import queries
+from db.queries import NOT_PARENT_SQL
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 
@@ -48,8 +49,13 @@ def _filter_by_mode(rows, mode: str) -> list:
 
 def _fetch_month_transactions(conn: sqlite3.Connection, start: str, end: str,
                                mode: str = MODE_FINALIZED) -> list[dict]:
-    """Fetch transactions for a date range, filtered by report mode."""
-    rows = queries.get_transactions(conn, start_date=start, end_date=end)
+    """Fetch transactions for a date range, filtered by report mode.
+
+    Split parents are excluded — their legs carry the dollars, so counting both
+    would double the amount.
+    """
+    rows = queries.get_transactions(conn, start_date=start, end_date=end,
+                                    exclude_parents=True)
     return [dict(r) for r in _filter_by_mode(rows, mode)]
 
 
@@ -58,7 +64,8 @@ def _fetch_ytd_transactions(conn: sqlite3.Connection, end: str,
     """Fetch transactions from Jan 1 of the end-date year, filtered by mode."""
     year = end[:4]
     ytd_start = f"{year}-01-01"
-    rows = queries.get_transactions(conn, start_date=ytd_start, end_date=end)
+    rows = queries.get_transactions(conn, start_date=ytd_start, end_date=end,
+                                    exclude_parents=True)
     return [dict(r) for r in _filter_by_mode(rows, mode)]
 
 
@@ -67,7 +74,8 @@ def count_unfinalized(conn: sqlite3.Connection, start: str, end: str) -> tuple[i
     row = conn.execute(
         "SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total "
         "FROM transactions WHERE date >= ? AND date <= ? "
-        "AND status IN ('pending', 'needs_review')",
+        "AND status IN ('pending', 'needs_review') "
+        f"AND {NOT_PARENT_SQL}",
         (start, end),
     ).fetchone()
     return row["cnt"], Decimal(str(row["total"]))
@@ -88,10 +96,47 @@ def count_missing_payee(conn: sqlite3.Connection, start: str, end: str,
     sql = (
         f"SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total "
         f"FROM transactions WHERE date >= ? AND date <= ? "
-        f"AND payee IS NULL {status_clause}"
+        f"AND payee IS NULL {status_clause} AND {NOT_PARENT_SQL}"
     )
     row = conn.execute(sql, (start, end)).fetchone()
     return row["cnt"], Decimal(str(row["total"]))
+
+
+def _write_split_integrity(pdf: "AbacusPDF", conn) -> None:
+    """Per-split balance check, rendered on page 1 below the checksums.
+
+    This catches the one corruption the MATCH checksum cannot: a split whose
+    legs no longer sum to its parent. The MATCH check excludes parents on both
+    sides, so a missing/edited leg understates report and DB totals equally and
+    still reads OK. This block verifies each split independently and names any
+    that don't balance.
+    """
+    broken = queries.check_split_integrity(conn)
+    pdf.section_title("Split Integrity")
+    if not broken:
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.cell(0, 5, "All splits balance (every split's legs sum to its parent).",
+                 new_x="LMARGIN", new_y="NEXT")
+        return
+
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.set_text_color(180, 0, 0)
+    pdf.cell(0, 5,
+             f"*** {len(broken)} UNBALANCED SPLIT(S) - inspect and fix in "
+             f"Maintenance > Split Transaction ***",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+    widths = [22, 26, 64, 28, 28, 28]
+    pdf.table_header(widths, ["Parent ID", "Date", "Description",
+                              "Parent", "Legs sum", "Difference"])
+    for b in broken:
+        pdf.table_row(
+            widths,
+            [str(b["id"]), b["date"], _safe(b["description_raw"])[:42],
+             _fmt_amt(b["parent_amount"]), _fmt_amt(b["legs_total"]),
+             _fmt_amt(b["difference"])],
+            amount_cols=[3, 4, 5],
+        )
 
 
 def _sum_by(txns: list[dict], *keys) -> dict[tuple, Decimal]:
@@ -749,16 +794,18 @@ def _write_checksums(pdf: AbacusPDF, conn, start, end,
     year = end[:4]
     ytd_start = f"{year}-01-01"
 
-    # Database counts (all statuses)
+    # Database counts (all statuses). Split parents are excluded from every
+    # checksum query so that all numbers here reflect counted rows and the
+    # MATCH check lines up with the report body (which also excludes parents).
     db_month_all = conn.execute(
         "SELECT COUNT(*) as cnt, COALESCE(SUM(amount), 0) as total "
-        "FROM transactions WHERE date >= ? AND date <= ?",
+        f"FROM transactions WHERE date >= ? AND date <= ? AND {NOT_PARENT_SQL}",
         (start, end),
     ).fetchone()
 
     db_ytd_all = conn.execute(
         "SELECT COUNT(*) as cnt, COALESCE(SUM(amount), 0) as total "
-        "FROM transactions WHERE date >= ? AND date <= ?",
+        f"FROM transactions WHERE date >= ? AND date <= ? AND {NOT_PARENT_SQL}",
         (ytd_start, end),
     ).fetchone()
 
@@ -775,26 +822,30 @@ def _write_checksums(pdf: AbacusPDF, conn, start, end,
 
     db_month_in_scope = conn.execute(
         f"SELECT COUNT(*) as cnt, COALESCE(SUM(amount), 0) as total "
-        f"FROM transactions WHERE date >= ? AND date <= ? AND {scope_clause}",
+        f"FROM transactions WHERE date >= ? AND date <= ? AND {scope_clause} "
+        f"AND {NOT_PARENT_SQL}",
         (start, end),
     ).fetchone()
 
     db_ytd_in_scope = conn.execute(
         f"SELECT COUNT(*) as cnt, COALESCE(SUM(amount), 0) as total "
-        f"FROM transactions WHERE date >= ? AND date <= ? AND {scope_clause}",
+        f"FROM transactions WHERE date >= ? AND date <= ? AND {scope_clause} "
+        f"AND {NOT_PARENT_SQL}",
         (ytd_start, end),
     ).fetchone()
 
     # Counts outside the chosen scope (just for reference)
     db_month_out_of_scope = conn.execute(
         f"SELECT COUNT(*) as cnt FROM transactions "
-        f"WHERE date >= ? AND date <= ? AND {out_of_scope_clause}",
+        f"WHERE date >= ? AND date <= ? AND {out_of_scope_clause} "
+        f"AND {NOT_PARENT_SQL}",
         (start, end),
     ).fetchone()["cnt"]
 
     db_ytd_out_of_scope = conn.execute(
         f"SELECT COUNT(*) as cnt FROM transactions "
-        f"WHERE date >= ? AND date <= ? AND {out_of_scope_clause}",
+        f"WHERE date >= ? AND date <= ? AND {out_of_scope_clause} "
+        f"AND {NOT_PARENT_SQL}",
         (ytd_start, end),
     ).fetchone()["cnt"]
 
@@ -968,6 +1019,7 @@ def generate_monthly_pdf(conn: sqlite3.Connection, start: str, end: str,
     _write_top_banners(pdf, conn, start, end, mode)
     _write_checksums(pdf, conn, start, end, month_txns, ytd_txns,
                      month_no_xfer, ytd_no_xfer, month_xfer, mode=mode)
+    _write_split_integrity(pdf, conn)
 
     if "category_summary" in sections:
         pdf.set_section("Category Summary")
@@ -1037,7 +1089,8 @@ def generate_excel_export(conn: sqlite3.Connection, start: str, end: str,
     """Generate an Excel export of transactions in a date range, filtered by mode."""
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    rows = queries.get_transactions(conn, start_date=start, end_date=end)
+    rows = queries.get_transactions(conn, start_date=start, end_date=end,
+                                    exclude_parents=True)
     rows = _filter_by_mode(rows, mode)
 
     wb = openpyxl.Workbook()

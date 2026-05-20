@@ -69,6 +69,9 @@ def browse_page(conn):
                                    key="browse_status")
 
     # --- Query ---
+    # Browse mirrors the reports: split parents are excluded (their dollars and
+    # categories live on the legs), so a parent's stale pre-split category can't
+    # surface it in a search. Legs are shown, tagged in the Split column.
     rows = queries.get_transactions(
         conn,
         start_date=start_date.isoformat() if start_date else None,
@@ -77,6 +80,7 @@ def browse_page(conn):
         search_payee=search_payee or None,
         search=search_all or None,
         status=status_filter if status_filter != "All" else None,
+        exclude_parents=True,
     )
 
     if not rows:
@@ -91,6 +95,7 @@ def browse_page(conn):
         data.append({
             "Date": r["date"],
             "Source": r["source"],
+            "Split": "leg" if r["split_parent_id"] is not None else "",
             "Payee": r["payee"] or "",
             "Category": r["category"] or "",
             "Subcategory": r["subcategory"] or "",
@@ -104,7 +109,7 @@ def browse_page(conn):
 
     df = pd.DataFrame(data)
 
-    # --- Summary ---
+    # --- Summary --- (parents already excluded; legs carry the dollars)
     total_out = df[df["Amount"] < 0]["Amount"].sum()
     total_in = df[df["Amount"] > 0]["Amount"].sum()
     col_a, col_b, col_c = st.columns(3)

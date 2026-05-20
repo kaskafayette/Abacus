@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS transactions (
     source          TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'confirmed', 'needs_review')),
-    overridden      BOOLEAN NOT NULL DEFAULT 0
+    overridden      BOOLEAN NOT NULL DEFAULT 0,
+    split_parent_id INTEGER REFERENCES transactions(id)
 );
 
 CREATE TABLE IF NOT EXISTS payee_normalization (
@@ -213,6 +214,7 @@ def init_db(db_path: Path | None = None) -> tuple[sqlite3.Connection, bool]:
 
     _migrate_source_file_map(conn)
     _migrate_venmo_to_via_only(conn)
+    _migrate_add_split_parent_id(conn)
 
     if is_new:
         conn.executemany(
@@ -282,6 +284,27 @@ def _migrate_source_file_map(conn: sqlite3.Connection) -> None:
     if not has_replaced:
         conn.execute("ALTER TABLE source_file_map ADD COLUMN replaced_by_prefix TEXT")
     conn.commit()
+
+
+def _migrate_add_split_parent_id(conn: sqlite3.Connection) -> None:
+    """Add the split_parent_id column to transactions if it is missing.
+
+    A non-NULL split_parent_id marks a row as a "leg" of a split, pointing at
+    the original (parent) transaction's id. A row that is referenced by any
+    leg is a "parent": it stays in the table untouched (so re-ingest dedup and
+    bank-statement comparison both still match) but is excluded from every
+    report total. Parent-ness is derived from the references, never stored, so
+    it can't fall out of sync. See [[project-abacus]] splitting design.
+
+    Idempotent: only adds the column when it isn't already present.
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}
+    if "split_parent_id" not in cols:
+        conn.execute(
+            "ALTER TABLE transactions ADD COLUMN split_parent_id INTEGER "
+            "REFERENCES transactions(id)"
+        )
+        conn.commit()
 
 
 def _migrate_venmo_to_via_only(conn: sqlite3.Connection) -> None:
