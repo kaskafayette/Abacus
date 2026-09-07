@@ -119,11 +119,13 @@ CREATE TABLE IF NOT EXISTS non_cash_donations (
 );
 """
 
-# Enrichment-source seeds inserted on first init. Account types ending in
-# _detail are handled by the enrichment pipeline rather than column templates.
+# Special-source seeds inserted on first init. Venmo is now a first-class
+# checking-style source (its own ingest path in processing/ingest.py handles
+# the Venmo statement CSV format). Amazon remains an enrichment source until
+# the item-level parser is built.
 SEED_ENRICHMENT_SOURCES = [
     # (source_prefix, source_label, nickname, account_type)
-    ("Venmo",  "Venmo",  "Venmo (shared)",  "venmo_detail"),
+    ("Venmo",  "Venmo",  "Venmo (shared)",  "checking"),
     ("Amazon", "Amazon", "Amazon (shared)", "amazon_detail"),
 ]
 
@@ -228,6 +230,7 @@ def init_db(db_path: Path | None = None) -> tuple[sqlite3.Connection, bool]:
     _migrate_source_file_map(conn)
     _migrate_venmo_to_via_only(conn)
     _migrate_add_split_parent_id(conn)
+    _migrate_venmo_source_to_checking(conn)
 
     if is_new:
         conn.executemany(
@@ -296,6 +299,22 @@ def _migrate_source_file_map(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE source_file_map ADD COLUMN discontinued_since DATE")
     if not has_replaced:
         conn.execute("ALTER TABLE source_file_map ADD COLUMN replaced_by_prefix TEXT")
+    conn.commit()
+
+
+def _migrate_venmo_source_to_checking(conn: sqlite3.Connection) -> None:
+    """Change the Venmo source's account_type from 'venmo_detail' to 'checking'.
+
+    Venmo used to be an enrichment source (its statement patched Chase rows).
+    It's now a first-class checking-style source with its own ingest path, so
+    the account_type needs to flip and the venmo_detail enricher gets retired.
+    Idempotent: no-op once the type is already 'checking' (or if the Venmo
+    source row was never created).
+    """
+    conn.execute(
+        "UPDATE source_file_map SET account_type = 'checking' "
+        "WHERE source_prefix = 'Venmo' AND account_type = 'venmo_detail'"
+    )
     conn.commit()
 
 

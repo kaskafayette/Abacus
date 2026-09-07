@@ -49,9 +49,14 @@ PLACEHOLDER_PAYEES = frozenset({
 # Categories must exist in the categories table (see db/schema.SEED_CATEGORIES).
 DEFAULT_CATEGORY_PATTERNS = [
     {
+        # Chase VENMO PAYMENT rows are now transfers to the Venmo account
+        # (Venmo is a first-class checking-style source in Abacus). The real
+        # spend is captured on the Venmo side; the Chase side just moves
+        # money between accounts. Cutover applies from 2026-09-01 forward —
+        # rows dated earlier keep whatever category they already had.
         "pattern": re.compile(r"VENMO\s+PAYMENT", re.IGNORECASE),
-        "category": "Cash",
-        "subcategory": "Deposited or Withdrawn",
+        "category": "Transfer",
+        "subcategory": None,
         "tax_flags": None,
         "via": "Venmo",
     },

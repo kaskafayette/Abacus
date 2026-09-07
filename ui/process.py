@@ -230,10 +230,16 @@ def _commit_ingestion(conn):
         filepath = INPUT_DIR / r.filename
         if not filepath.exists():
             continue
-        template = r.template or queries.get_column_template(conn, r.parsed["prefix"])
-        if not template:
-            st.error(f"No template for {r.parsed['prefix']} — skipping.")
-            continue
+        prefix = r.parsed["prefix"]
+        # Venmo has its own parser (statement CSV — banner rows etc.) and
+        # doesn't need a column template.
+        if prefix.lower() == "venmo":
+            template = None
+        else:
+            template = r.template or queries.get_column_template(conn, prefix)
+            if not template:
+                st.error(f"No template for {prefix} — skipping.")
+                continue
         try:
             fresh, skipped = ingest_file(conn, filepath, template)
             ingested += 1

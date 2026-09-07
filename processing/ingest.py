@@ -126,6 +126,15 @@ def _validate_one(conn: sqlite3.Connection, filepath: Path,
         result.is_enrichment = True
         return result
 
+    # Venmo is a first-class checking-style source but its statement CSV has
+    # banner rows and balance markers that the generic column-template parser
+    # can't handle. Its own parser lives in processing/venmo_ingest.py, so we
+    # short-circuit the template requirement here.
+    if prefix.lower() == "venmo":
+        result.template = None  # signals the Venmo path
+        _check_continuity(conn, result, parsed, prefix, template=None)
+        return result
+
     template = queries.get_column_template(conn, prefix)
     if template is None:
         result.needs_template = True
@@ -352,16 +361,26 @@ def _parse_amount(row: dict, template: sqlite3.Row) -> Decimal | None:
 # ---------------------------------------------------------------------------
 
 def ingest_file(conn: sqlite3.Connection, filepath: Path,
-                template: sqlite3.Row) -> tuple[list[dict], int]:
+                template) -> tuple[list[dict], int]:
     """Parse a file and insert transactions. Returns (inserted_rows, skipped_count).
 
     Row-level duplicates are silently skipped — overlapping date ranges across
     consecutive files are expected, and the (date+source+amount+description_raw)
     tuple uniquely identifies a transaction. The skipped count is surfaced so
     the UI can display "ingested N, skipped M as duplicates."
+
+    Venmo files (prefix 'Venmo') take a special parser path that understands
+    the statement CSV's banner rows and balance markers; `template` is ignored
+    (and may be None) in that case.
     """
-    transactions = parse_file_with_template(filepath, template, conn)
     parsed_info = parse_filename(filepath.name)
+    prefix = parsed_info["prefix"]
+
+    if prefix.lower() == "venmo":
+        from processing.venmo_ingest import parse_venmo_transactions
+        transactions = parse_venmo_transactions(filepath)
+    else:
+        transactions = parse_file_with_template(filepath, template, conn)
 
     # Row-level duplicate filter (silent)
     fresh = []

@@ -144,13 +144,11 @@ _VENMO_BANNER_ROWS = 2
 _CHASE_FUNDING_RE = re.compile(r"Chase.*\*\d{4}", re.IGNORECASE)
 
 
-@register_enricher(
-    "venmo_detail",
-    match_strategy="amount_date_window",
-    match_source="Chase5616",
-    match_description_like="VENMO%PAYMENT%",
-    date_window_days=4,
-)
+# NOTE (2026-09): The venmo_detail enricher is retired. Venmo is now a
+# first-class checking-style source with its own ingest path (see
+# processing/venmo_ingest.py). The parse_venmo function is preserved
+# (without registration) so the Venmo-ingest path can reuse its CSV parsing
+# helpers (banner-row skip, Datetime parsing, amount cleanup).
 def parse_venmo(filepath: Path) -> list[EnrichmentRecord]:
     """Parse a Venmo monthly statement CSV into enrichment records.
 
