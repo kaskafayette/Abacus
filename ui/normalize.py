@@ -447,11 +447,16 @@ def _categorization(conn):
             latest_date = max(t["date"] for t in txns)
             cat = txns[0]["category"] or ""
             subcat = txns[0]["subcategory"] or ""
+            # If every txn in this payee group is a check, show a comma-list of
+            # check numbers so you can still see them; otherwise blank (mixed).
+            check_nums = [t["check_number"] for t in txns if t["check_number"]]
+            check_str = ", ".join(check_nums) if len(check_nums) == len(txns) else ""
             grid_data.append({
                 "Payee": payee,
                 "# Txns": len(txns),
                 "Total": round(total, 2),
                 "Last Date": latest_date,
+                "Check #": check_str,
                 "Category": cat,
                 "Subcategory": subcat,
                 "Tax Flags": _resolve_tax_flags(cat, subcat, txns[0]["tax_flags"]),
@@ -468,6 +473,7 @@ def _categorization(conn):
                 "# Txns": 1,
                 "Total": round(float(t["amount"]), 2),
                 "Last Date": t["date"],
+                "Check #": t["check_number"] or "",
                 "Category": cat,
                 "Subcategory": subcat,
                 "Tax Flags": _resolve_tax_flags(cat, subcat, t["tax_flags"]),
@@ -489,18 +495,25 @@ def _categorization(conn):
             "Edit inline. Click **Save All** when done."
         )
 
-    # JavaScript to dynamically filter subcategory based on category
+    # JavaScript to dynamically filter subcategory based on the row's category.
+    # NOTE: st_aggrid only converts JsCode at top-level column-def positions.
+    # Passing a JsCode function via `cellEditorParams` (a nested position)
+    # leaves it as a string on the JS side and the dropdown ends up empty.
+    # Using `cellEditorSelector` (top-level) works reliably: it returns
+    # {component, params} at editor-open time, with `params` freshly computed
+    # from the current row's Category.
     import json
     subcats_json = json.dumps(subcats_map)
 
-    subcat_cell_editor_params = JsCode(f"""
+    subcat_editor_selector = JsCode(f"""
         function(params) {{
             var subcatsMap = {subcats_json};
             var cat = params.data.Category;
-            if (cat && subcatsMap[cat]) {{
-                return {{ values: subcatsMap[cat] }};
-            }}
-            return {{ values: [''] }};
+            var values = (cat && subcatsMap[cat]) ? subcatsMap[cat] : [''];
+            return {{
+                component: 'agSelectCellEditor',
+                params: {{ values: values }}
+            }};
         }}
     """)
 
@@ -515,6 +528,9 @@ def _categorization(conn):
     else:
         gb.configure_column("# Txns", hide=True)
     gb.configure_column("Last Date", width=100)
+    # Check # (read-only) — populated only for check rows so you can identify
+    # which check you're categorizing from your check register.
+    gb.configure_column("Check #", width=80)
     from ui._amount_style import amount_cell_style, amount_value_formatter
     gb.configure_column("Total", width=100,
                         type=["numericColumn"],
@@ -528,8 +544,7 @@ def _categorization(conn):
                         cellEditor="agSelectCellEditor",
                         cellEditorParams={"values": [""] + category_names})
     gb.configure_column("Subcategory", editable=True, width=160,
-                        cellEditor="agSelectCellEditor",
-                        cellEditorParams=subcat_cell_editor_params)
+                        cellEditorSelector=subcat_editor_selector)
     tax_flag_values = [
         "", "Tax-reportable", "Reimbursable", "Capital Improvements",
         "Home Office", "Donations - Deductible", "Medical", "Business Expense",

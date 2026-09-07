@@ -28,7 +28,7 @@ MODE_ALL = "all"
 
 MODE_CHOICES = [MODE_FINALIZED, MODE_DRAFT, MODE_ALL]
 MODE_LABELS = {
-    MODE_FINALIZED: "Finalized only",
+    MODE_FINALIZED: "Confirmed only",
     MODE_DRAFT: "Draft only",
     MODE_ALL: "All transactions",
 }
@@ -964,13 +964,13 @@ def _write_top_banners(pdf: AbacusPDF, conn: sqlite3.Connection,
     pdf.set_font("Helvetica", "", 9)
     if mode == MODE_FINALIZED:
         banner = (f"This report EXCLUDES {nf_count} transaction(s) totaling "
-                  f"{_fmt_amt(nf_total)} that are not finalized.")
+                  f"{_fmt_amt(nf_total)} that are not yet confirmed.")
     elif mode == MODE_DRAFT:
         banner = (f"This report INCLUDES ONLY draft transactions: {nf_count} "
-                  f"totaling {_fmt_amt(nf_total)} (not yet finalized).")
+                  f"totaling {_fmt_amt(nf_total)} (not yet confirmed).")
     else:  # MODE_ALL
         banner = (f"This report INCLUDES {nf_count} transaction(s) totaling "
-                  f"{_fmt_amt(nf_total)} that are not finalized.")
+                  f"{_fmt_amt(nf_total)} that are not yet confirmed.")
     pdf.cell(0, 5, _safe(banner), new_x="LMARGIN", new_y="NEXT")
 
     # Missing-payee warning (only if any in-scope rows have NULL payee)
@@ -1126,7 +1126,7 @@ def generate_excel_export(conn: sqlite3.Connection, start: str, end: str,
     for col_idx, h in enumerate(headers, 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = max(len(h) + 4, 12)
 
-    mode_suffix = {MODE_FINALIZED: "finalized", MODE_DRAFT: "draft", MODE_ALL: "all"}.get(mode, mode)
+    mode_suffix = {MODE_FINALIZED: "confirmed", MODE_DRAFT: "draft", MODE_ALL: "all"}.get(mode, mode)
     filename = f"Transactions_{start}_to_{end}_{mode_suffix}.xlsx"
     out_path = OUTPUT_DIR / filename
     wb.save(str(out_path))

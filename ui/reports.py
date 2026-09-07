@@ -5,6 +5,7 @@ import streamlit as st
 from datetime import date
 
 from db import queries
+from db.queries import NOT_PARENT_SQL
 from processing.reports import (
     generate_monthly_pdf, generate_excel_export, OUTPUT_DIR,
     MODE_CHOICES, MODE_LABELS, MODE_FINALIZED, MODE_DRAFT, MODE_ALL,
@@ -35,10 +36,14 @@ def _scope_selector(key: str) -> str:
         index=MODE_CHOICES.index(MODE_FINALIZED),
         key=key,
         help=(
-            "Finalized only: status='confirmed' rows (used for tax filings, "
-            "final reports). Draft only: status in {'pending','needs_review'} "
-            "(used to see what's outstanding). All transactions: everything "
-            "in the period regardless of status."
+            "**Confirmed only** — includes rows with `status = 'confirmed'` "
+            "(you've reviewed and approved them). Use for tax filings and "
+            "final reports.\n\n"
+            "**Draft only** — includes rows with `status IN ('pending', "
+            "'needs_review')` (imported but not yet approved, or flagged for "
+            "follow-up). Use to see what's still outstanding.\n\n"
+            "**All transactions** — every row in the period regardless of "
+            "status."
         ),
     )
     return label
@@ -58,6 +63,94 @@ def _count_in_scope(conn, start_str: str, end_str: str, mode: str) -> int:
         (start_str, end_str),
     ).fetchone()
     return row["cnt"]
+
+
+def _count_unconfirmed_abs(conn, start_str: str, end_str: str) -> tuple[int, float]:
+    """Count and abs-sum of unconfirmed rows in range (split parents excluded).
+
+    Absolute-value sum is intentional so big negatives and positives cannot
+    cancel each other out and mask items that still need review.
+    """
+    row = conn.execute(
+        f"SELECT COUNT(*) AS cnt, COALESCE(SUM(ABS(amount)), 0) AS total "
+        f"FROM transactions WHERE date >= ? AND date <= ? "
+        f"AND status != 'confirmed' AND {NOT_PARENT_SQL}",
+        (start_str, end_str),
+    ).fetchone()
+    return int(row["cnt"]), float(row["total"] or 0.0)
+
+
+@st.dialog("Unconfirmed items in this period")
+def _unconfirmed_modal(count: int, abs_total: float, action_key: str):
+    """Modal shown before running a Confirmed-only report when there are still
+    unconfirmed items in scope. Three buttons set `st.session_state[action_key]`
+    and rerun so the caller (via `_proceed_or_gate`) can act."""
+    st.warning(
+        f"There are **{count}** transactions in this period that are "
+        f"**not yet confirmed**, totaling **${abs_total:,.2f}** (absolute "
+        f"value — no big subtotals canceling each other out and hiding items "
+        f"that need review).\n\n"
+        f"With the scope set to **Confirmed only**, these won't appear in the "
+        f"report. What would you like to do?"
+    )
+    c1, c2, c3 = st.columns(3)
+    if c1.button("Review the items", key=f"{action_key}_review"):
+        st.session_state[action_key] = "review"
+        st.rerun()
+    if c2.button("Run report anyway", type="primary", key=f"{action_key}_run"):
+        st.session_state[action_key] = "run"
+        st.rerun()
+    if c3.button("Cancel", key=f"{action_key}_cancel"):
+        st.session_state[action_key] = "cancel"
+        st.rerun()
+
+
+def _proceed_or_gate(conn, start_str: str, end_str: str, mode: str,
+                     pending_key: str) -> bool:
+    """Central gate for a Generate/Export button.
+
+    Set `st.session_state[pending_key] = True` when the user clicks Generate;
+    then call this to decide whether to actually run the report. Returns True
+    exactly when the report should proceed this run:
+      - The user isn't asking to generate (no pending flag) -> False
+      - Mode isn't Confirmed-only -> True immediately (user opted in to
+        include unconfirmed/all)
+      - Mode is Confirmed-only and there are no unconfirmed items -> True
+      - Otherwise a modal opens; returns False. On the user's choice
+        (Review / Run anyway / Cancel) the next rerun's call returns
+        True (run) or False with a message (review / cancel).
+    """
+    if not st.session_state.get(pending_key):
+        return False
+
+    action_key = f"{pending_key}_action"
+    action = st.session_state.pop(action_key, None)
+
+    if action == "review":
+        st.session_state.pop(pending_key, None)
+        st.info("Open the **Normalize & Categorize** page from the sidebar to "
+                "review the unconfirmed items.")
+        return False
+    if action == "cancel":
+        st.session_state.pop(pending_key, None)
+        st.info("Report generation cancelled.")
+        return False
+    if action == "run":
+        st.session_state.pop(pending_key, None)
+        return True
+
+    # First check: does the gate apply?
+    if mode != MODE_FINALIZED:
+        st.session_state.pop(pending_key, None)
+        return True
+    count, abs_total = _count_unconfirmed_abs(conn, start_str, end_str)
+    if count == 0:
+        st.session_state.pop(pending_key, None)
+        return True
+
+    # Open the modal. Pending stays True until the user picks an option.
+    _unconfirmed_modal(count, abs_total, action_key)
+    return False
 
 
 def reports_page(conn):
@@ -138,6 +231,10 @@ def _monthly_report(conn):
     do_tax = st.checkbox("Tax Items (Month & YTD)", value=True, key="rpt_tax")
 
     if st.button("Generate Monthly Report", type="primary", key="gen_monthly"):
+        st.session_state["gen_monthly_pending"] = True
+
+    if _proceed_or_gate(conn, month_start_str, month_end_str, mode,
+                        "gen_monthly_pending"):
         if month_count == 0:
             st.warning(f"No transactions in scope ({MODE_LABELS[mode]}) for this month. Nothing to report.")
             return
@@ -187,6 +284,9 @@ def _adhoc_reports(conn):
     st.caption(f"{txn_count} transaction(s) in scope ({MODE_LABELS[mode]})")
 
     if st.button("Generate", key="adhoc_gen"):
+        st.session_state["adhoc_gen_pending"] = True
+
+    if _proceed_or_gate(conn, start_str, end_str, mode, "adhoc_gen_pending"):
         if txn_count == 0:
             st.warning(f"No transactions in scope ({MODE_LABELS[mode]}) in the selected range.")
             return
@@ -219,6 +319,9 @@ def _excel_export(conn):
     st.caption(f"{txn_count} transaction(s) in scope ({MODE_LABELS[mode]})")
 
     if st.button("Export", key="excel_gen"):
+        st.session_state["excel_gen_pending"] = True
+
+    if _proceed_or_gate(conn, start_str, end_str, mode, "excel_gen_pending"):
         if txn_count == 0:
             st.warning(f"No transactions in scope ({MODE_LABELS[mode]}) in the selected range.")
             return

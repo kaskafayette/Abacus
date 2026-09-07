@@ -982,11 +982,15 @@ def _render_split_editor(conn, txn_id, key_prefix="split"):
     df = pd.DataFrame(legs_rows, columns=_SPLIT_COLS)
 
     # Subcategory dropdown narrows to the row's selected Category (same cascade
-    # as the Categorize tab).
-    subcat_editor = JsCode(
+    # as the Categorize tab). Uses cellEditorSelector at the top level of the
+    # column def — st_aggrid only converts JsCode reliably at that position;
+    # a JsCode passed as `cellEditorParams` (nested) stays a string on the JS
+    # side and the dropdown ends up empty.
+    subcat_selector = JsCode(
         "function(params){ var m=" + json.dumps(subcats_map) + ";"
         " var c=params.data.Category;"
-        " if(c && m[c]){ return {values: m[c]}; } return {values: ['']}; }"
+        " var vals=(c && m[c])?m[c]:[''];"
+        " return {component:'agSelectCellEditor', params:{values:vals}}; }"
     )
     from ui._amount_style import amount_cell_style, amount_value_formatter
     gb = GridOptionsBuilder.from_dataframe(df)
@@ -997,8 +1001,8 @@ def _render_split_editor(conn, txn_id, key_prefix="split"):
                         cellStyle=amount_cell_style())
     gb.configure_column("Category", width=160, cellEditor="agSelectCellEditor",
                         cellEditorParams={"values": [""] + category_names})
-    gb.configure_column("Subcategory", width=180, cellEditor="agSelectCellEditor",
-                        cellEditorParams=subcat_editor)
+    gb.configure_column("Subcategory", width=180,
+                        cellEditorSelector=subcat_selector)
     gb.configure_column("Payee", width=160)
     gb.configure_column("Payor", width=100, cellEditor="agSelectCellEditor",
                         cellEditorParams={"values": payor_options})
