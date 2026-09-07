@@ -104,6 +104,19 @@ CREATE TABLE IF NOT EXISTS item_metadata (
     subcategory  TEXT,
     tax_flags    TEXT
 );
+
+-- Non-cash charitable donations logged manually (goods, vehicles, stock, etc.)
+-- Not part of the bank-transaction stream — it never touches Chase or Fidelity.
+-- Feeds a section of the annual tax-items report at year-end.
+CREATE TABLE IF NOT EXISTS non_cash_donations (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    date             DATE NOT NULL,
+    amount           DECIMAL NOT NULL,
+    recipient        TEXT NOT NULL,
+    description      TEXT,
+    reference_number TEXT,
+    created_at       DATETIME NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 # Enrichment-source seeds inserted on first init. Account types ending in

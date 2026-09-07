@@ -26,7 +26,8 @@ def main():
 
     page = st.sidebar.radio(
         "Navigate",
-        ["Home", "Browse / Search", "Ingest", "Normalize & Categorize", "Reports", "Maintenance"],
+        ["Home", "Browse / Search", "Ingest", "Normalize & Categorize",
+         "Non-cash Donations", "Reports", "Maintenance"],
         label_visibility="collapsed",
     )
 
@@ -41,6 +42,9 @@ def main():
     elif page == "Normalize & Categorize":
         from ui.normalize import normalize_page
         normalize_page(conn)
+    elif page == "Non-cash Donations":
+        from ui.donations import donations_page
+        donations_page(conn)
     elif page == "Reports":
         from ui.reports import reports_page
         reports_page(conn)

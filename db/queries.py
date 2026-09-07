@@ -626,6 +626,59 @@ def delete_item_metadata(conn: sqlite3.Connection, row_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Non-cash charitable donations (goods, vehicles, stock, etc.)
+# Logged manually — never touches Chase/Fidelity. Feeds the tax-items report.
+# ---------------------------------------------------------------------------
+
+def list_non_cash_donations(conn: sqlite3.Connection,
+                             year: int | None = None) -> list[sqlite3.Row]:
+    """Return donations, optionally scoped to a calendar year, newest first."""
+    if year:
+        return conn.execute(
+            "SELECT * FROM non_cash_donations "
+            "WHERE date >= ? AND date <= ? "
+            "ORDER BY date DESC, id DESC",
+            (f"{year}-01-01", f"{year}-12-31"),
+        ).fetchall()
+    return conn.execute(
+        "SELECT * FROM non_cash_donations ORDER BY date DESC, id DESC"
+    ).fetchall()
+
+
+def insert_non_cash_donation(conn: sqlite3.Connection, date: str,
+                              amount, recipient: str,
+                              description: str | None = None,
+                              reference_number: str | None = None) -> int:
+    """Insert a new non-cash donation; returns the new row id."""
+    cur = conn.execute(
+        "INSERT INTO non_cash_donations "
+        "(date, amount, recipient, description, reference_number) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (date, str(amount), recipient, description, reference_number),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def update_non_cash_donation(conn: sqlite3.Connection, donation_id: int,
+                              **kwargs) -> None:
+    """Update fields on a donation by id. Pass only the columns you want changed."""
+    if not kwargs:
+        return
+    sets = ", ".join(f"{k} = ?" for k in kwargs)
+    vals = [str(v) if k == "amount" else v for k, v in kwargs.items()]
+    vals.append(donation_id)
+    conn.execute(f"UPDATE non_cash_donations SET {sets} WHERE id = ?", vals)
+    conn.commit()
+
+
+def delete_non_cash_donation(conn: sqlite3.Connection, donation_id: int) -> None:
+    """Delete a donation by id."""
+    conn.execute("DELETE FROM non_cash_donations WHERE id = ?", (donation_id,))
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
 # Stats / utility
 # ---------------------------------------------------------------------------
 
@@ -633,7 +686,7 @@ def get_table_counts(conn: sqlite3.Connection) -> dict[str, int]:
     """Row counts for all tables."""
     tables = ["transactions", "payee_normalization", "payee_metadata",
               "categories", "source_file_map", "column_templates", "processed_files",
-              "item_metadata"]
+              "item_metadata", "non_cash_donations"]
     counts = {}
     for t in tables:
         row = conn.execute(f"SELECT COUNT(*) as cnt FROM {t}").fetchone()
