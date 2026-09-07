@@ -326,6 +326,69 @@ def _extract_online_payment_payee(description: str) -> str | None:
     return None
 
 
+# PayPal: "PAYPAL *MERCHANTNAME <ref>" — PayPal is an intermediary and the
+# real merchant is usually embedded after the `*`. Bare "PAYPAL <ref>" (no
+# merchant) falls through to the placeholder-payee "Paypal".
+_PAYPAL_RE = re.compile(r"PAYPAL\s*\*\s*(.+?)(?:\s+\d{5,}.*)?$", re.IGNORECASE)
+
+
+def _extract_paypal_payee(description: str) -> str | None:
+    """Extract the merchant name from a PayPal description.
+
+    Matches 'PAYPAL *MERCHANTNAME [ref]' and returns MERCHANTNAME title-cased.
+    Returns None for bare PayPal descriptions with no embedded merchant.
+    """
+    if not re.match(r"PAYPAL", description, re.IGNORECASE):
+        return None
+    m = _PAYPAL_RE.match(description.strip())
+    if not m:
+        return None
+    name = m.group(1).strip()
+    if not name:
+        return None
+    return smart_title(name)
+
+
+# Check with embedded payee: Chase writes 'CHECK # 1040   STATE FARM RO 08 PYMT'
+# (or 'CHECK 1040 STATE FARM'). Bare 'CHECK 1040' has no embedded payee and
+# returns None. The returned string still needs to be matched against
+# payee_normalization rules for a canonical name.
+_CHECK_EMBEDDED_RE = re.compile(
+    r"^\s*CHECK\s*#?\s*\d+\s+(.+?)\s*$", re.IGNORECASE)
+
+
+def _extract_check_payee_text(description: str) -> str | None:
+    """Return the embedded payee text after the CHECK #### prefix, or None
+    if the description is a bare check (just 'CHECK 1040' with nothing after).
+    Does not normalize — returns the raw remainder for further matching."""
+    if not description:
+        return None
+    m = _CHECK_EMBEDDED_RE.match(description)
+    if not m:
+        return None
+    remainder = m.group(1).strip()
+    if not remainder:
+        return None
+    return remainder
+
+
+def _append_audit_note(conn: sqlite3.Connection, txn_id: int, tag: str) -> None:
+    """Append an audit-trail tag to a transaction's note field.
+
+    Used for check rows so the user can retrospectively see where the payee
+    came from (manual entry vs extracted from statement). No-op if the tag is
+    already present in the note. Existing note text is preserved.
+    """
+    row = conn.execute(
+        "SELECT note FROM transactions WHERE id = ?", (txn_id,)
+    ).fetchone()
+    existing = (row["note"] or "").strip() if row else ""
+    if tag in existing:
+        return  # idempotent
+    new_note = f"{existing} {tag}".strip() if existing else tag
+    queries.update_transaction(conn, txn_id, note=new_note)
+
+
 def detect_via(description: str) -> str | None:
     """Detect a payment intermediary from a raw description."""
     for pattern, via_name in VIA_PATTERNS:
@@ -414,6 +477,7 @@ def normalize_transactions(conn: sqlite3.Connection, transaction_ids: list[int] 
             continue
         raw = row["description_raw"]
         via = detect_via(raw)
+        is_check = bool(row["check_number"])
 
         # Special case: Zelle — extract payee name from description
         zelle_payee = _extract_zelle_payee(raw)
@@ -427,6 +491,51 @@ def normalize_transactions(conn: sqlite3.Connection, transaction_ids: list[int] 
         if online_payee:
             queries.update_transaction(conn, row["id"], payee=online_payee, via="Chase BillPay")
             matched += 1
+            continue
+
+        # Special case: PayPal — extract merchant name from "PAYPAL *MERCHANT".
+        # Bare "PAYPAL <ref>" (no merchant) falls through; a "PAYPAL" -> "Paypal"
+        # rule (if present) will then normalize it to the placeholder, and the
+        # Categorize UI will block category assignment until the user changes
+        # the payee to the real merchant.
+        paypal_payee = _extract_paypal_payee(raw)
+        if paypal_payee:
+            queries.update_transaction(conn, row["id"], payee=paypal_payee, via="PayPal")
+            matched += 1
+            continue
+
+        # Special case: check with embedded payee text (e.g.
+        # 'CHECK # 1040   STATE FARM RO 08 PYMT'). Strip the CHECK #### prefix
+        # and see whether the remainder matches an existing normalization rule.
+        # This never creates a new normalization rule (checks are unique per
+        # check number, so any rule keyed on the check description would be
+        # dead-on-arrival).
+        if is_check:
+            embedded = _extract_check_payee_text(raw)
+            if embedded:
+                m = queries.find_payee_match(conn, embedded)
+                if m:
+                    _append_audit_note(conn, row["id"],
+                                       "[payee extracted from check description]")
+                    queries.update_transaction(conn, row["id"],
+                                               payee=m["normalized_name"])
+                    matched += 1
+                    continue
+            # Check row that didn't auto-extract — leave for manual entry in
+            # Payee Normalization. Suggested name is the extracted remainder
+            # (or blank for bare checks so the user knows to type it).
+            unmatched.append({
+                "id": row["id"],
+                "description_raw": raw,
+                "cleaned_desc": strip_via_prefix(raw),
+                "suggested_name": smart_title(embedded) if embedded else "",
+                "via": via,
+                "date": row["date"],
+                "amount": row["amount"],
+                "source": row["source"],
+                "is_check": True,
+                "check_number": row["check_number"],
+            })
             continue
 
         match = queries.find_payee_match(conn, raw)
@@ -446,6 +555,8 @@ def normalize_transactions(conn: sqlite3.Connection, transaction_ids: list[int] 
                 "date": row["date"],
                 "amount": row["amount"],
                 "source": row["source"],
+                "is_check": False,
+                "check_number": None,
             })
 
     # Sort unmatched alphabetically by cleaned description

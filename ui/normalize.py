@@ -9,6 +9,7 @@ from db import queries
 from processing.normalize import (
     normalize_transactions, apply_normalization_edits, apply_pattern_rule,
     detect_via, strip_via_prefix, seed_normalization_rules,
+    _append_audit_note,
 )
 from processing.categorize import auto_categorize, apply_category_edits, save_payee_defaults
 from processing.placeholders import (
@@ -176,6 +177,46 @@ def normalize_page(conn):
 # Payee Normalization
 # ---------------------------------------------------------------------------
 
+def _render_check_required_block(check_items: list[dict]):
+    """Render the required-first block of check rows lacking a payee.
+
+    Each check needs a hand-entered payee (from the user's check register);
+    Commit All stays disabled until every field here is filled. Since check
+    descriptions are unique per check number, we render one row per check
+    (no de-duping).
+    """
+    col_h1, col_h2, col_h3, col_h4, col_h5 = st.columns([1, 1, 1.5, 1, 3])
+    col_h1.markdown("**Date**")
+    col_h2.markdown("**Check #**")
+    col_h3.markdown("**Amount**")
+    col_h4.markdown("**Source**")
+    col_h5.markdown("**Payee** (from your check register)")
+
+    for i, ci in enumerate(check_items):
+        c1, c2, c3, c4, c5 = st.columns([1, 1, 1.5, 1, 3])
+        c1.text(ci.get("date") or "")
+        c2.text(str(ci.get("check_number") or ""))
+        amt = float(ci.get("amount") or 0)
+        if amt > 0:
+            c3.markdown(f":green[\\${amt:,.2f}]")
+        elif amt < 0:
+            c3.text(f"-${abs(amt):,.2f}")
+        else:
+            c3.text("$0.00")
+        c4.text(ci.get("source") or "")
+        # If the extractor pulled a hint (e.g. "STATE FARM RO 08 PYMT") show
+        # it as the placeholder — often you'll trim it down and hit Commit.
+        default_val = st.session_state.get(
+            f"check_payee_field_{i}", ci.get("suggested_name", "") or "")
+        c5.text_input(
+            "payee", key=f"check_payee_field_{i}", value=default_val,
+            label_visibility="collapsed",
+            placeholder="Type the real payee",
+        )
+
+    st.divider()
+
+
 def _normalization(conn):
     st.subheader("Payee Normalization")
 
@@ -219,14 +260,36 @@ def _normalization(conn):
                 "total": 0.0,
                 "ids": [],
                 "raw": item["description_raw"],
+                "is_check": item.get("is_check", False),
+                "check_number": item.get("check_number"),
+                "date": item.get("date"),
+                "amount": item.get("amount"),
+                "source": item.get("source"),
             }
         desc_groups[desc]["count"] += 1
         desc_groups[desc]["total"] += float(item["amount"])
         desc_groups[desc]["ids"].append(item["id"])
 
-    display_items = sorted(desc_groups.values(), key=lambda x: x["suggested_name"].lower())
+    # Separate check rows (must be resolved first — checks have no bank-provided
+    # payee, and we can't proceed until the user identifies each one) from the
+    # general unmatched list.
+    all_items = sorted(desc_groups.values(), key=lambda x: (not x["is_check"], x["suggested_name"].lower()))
+    check_items = [x for x in all_items if x["is_check"]]
+    other_items = [x for x in all_items if not x["is_check"]]
 
-    st.warning(f"**{len(display_items)}** unique description(s), **{len(unmatched)}** transaction(s) remaining")
+    if check_items:
+        st.warning(
+            f"⚠ **{len(check_items)} check(s) need a payee before the rest of "
+            f"normalization can proceed.** Look them up in your check register "
+            f"and enter the real payee. (Each check number is unique — nothing "
+            f"is auto-saved as a reusable rule for these.)"
+        )
+        _render_check_required_block(check_items)
+
+    display_items = other_items
+
+    st.warning(f"**{len(display_items)}** other unique description(s), "
+               f"**{sum(x['count'] for x in display_items)}** transaction(s) remaining")
 
     st.caption(
         "Review each item. The **Suggested Name** is auto-generated. "
@@ -266,17 +329,57 @@ def _normalization(conn):
 
     st.divider()
 
+    # Gate Commit All when any check row still has an empty payee.
+    check_missing = [
+        i for i, ci in enumerate(check_items)
+        if not (st.session_state.get(f"check_payee_field_{i}", "") or "").strip()
+    ]
+
     # Bottom row: Commit All + Re-scan + counter
     col_c, col_r, col_caption = st.columns([1, 1, 3])
+    caption_bits = []
+    if check_items:
+        caption_bits.append(f"{len(check_items)} check(s) required first")
+    caption_bits.append(f"{len(display_items)} other description(s)")
     col_caption.caption(
-        f"{len(display_items)} description(s). Commit All writes every row "
-        "with a non-empty name; clear a field to skip that row."
+        ", ".join(caption_bits) +
+        ". Commit All writes every row with a non-empty name; clear a field "
+        "to skip that row."
     )
 
+    total_rows = len(display_items) + len(check_items)
+    disabled_reason = None
+    if total_rows == 0:
+        disabled_reason = "Nothing to commit."
+    elif check_missing:
+        disabled_reason = (
+            f"Assign a payee to all {len(check_items)} check(s) before "
+            f"committing ({len(check_missing)} still empty)."
+        )
+
     if col_c.button("Commit All", type="primary",
-                    disabled=(len(display_items) == 0)):
+                    disabled=(disabled_reason is not None),
+                    help=disabled_reason):
         committed = 0
         skipped = 0
+
+        # Check rows: NEVER create a normalization rule (dead-on-arrival —
+        # the description is unique per check number). Just set the payee and
+        # add the audit-trail note so the user can retrospectively see the
+        # payee was manually entered.
+        for i, ci in enumerate(check_items):
+            field_val = st.session_state.get(f"check_payee_field_{i}", "")
+            name = (field_val or "").strip()
+            if not name:
+                skipped += 1
+                continue
+            for tid in ci["ids"]:
+                queries.update_transaction(conn, tid, payee=name)
+                _append_audit_note(conn, tid, "[payee entered manually]")
+            committed += 1
+            st.session_state.pop(f"check_payee_field_{i}", None)
+
+        # Non-check rows: rules apply (each rule can match many future rows).
         for idx, item in enumerate(display_items):
             field_val = st.session_state.get(f"payee_field_{idx}", item["suggested_name"])
             name = field_val.strip() if field_val else ""
@@ -285,7 +388,6 @@ def _normalization(conn):
                 continue
 
             via = item["via"] or None
-            # Create a normalization rule using the cleaned description as the pattern
             pattern = item["cleaned_desc"]
             queries.insert_payee_normalization(conn, pattern, name)
             for tid in item["ids"]:
@@ -577,6 +679,7 @@ def _categorization(conn):
 
     if col1.button("Save Categorized", type="primary"):
         saved = 0
+        blocked_placeholders: set[str] = set()
         for _, row in edited_df.iterrows():
             payee = row["Payee"]
             cat = row["Category"]
@@ -586,6 +689,15 @@ def _categorization(conn):
             note = row["Note"]
 
             if not cat:
+                continue
+
+            # Refuse to categorize a row whose payee is still a placeholder
+            # (Paypal, Amazon, ...). The real merchant hides behind these
+            # intermediaries; a category set here would generalize wrongly
+            # to every future placeholder row. Change the payee to the real
+            # merchant on Payee Normalization / Rename & Merge first.
+            if is_placeholder_payee(payee):
+                blocked_placeholders.add(payee)
                 continue
 
             # Look up tax defaults if user didn't set flags manually
@@ -636,7 +748,15 @@ def _categorization(conn):
             saved += 1
 
         st.session_state.pop("cat_auto_done", None)
-        st.success(f"Saved {saved} item(s).")
+        msg = f"Saved {saved} item(s)."
+        if blocked_placeholders:
+            names = ", ".join(sorted(blocked_placeholders))
+            st.warning(
+                f"Skipped rows with placeholder payees ({names}) — change the "
+                f"payee to the real merchant on the **Rename / Merge Payees** "
+                f"tab (Maintenance) first, then come back and categorize."
+            )
+        st.success(msg)
         st.rerun()
 
     if col2.button("Set Rest to Needs Review"):

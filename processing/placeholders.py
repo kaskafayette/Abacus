@@ -30,6 +30,12 @@ import re
 # payee field stays empty until enrichment fills it with the real recipient.
 PLACEHOLDER_PAYEES = frozenset({
     "Amazon",
+    # Paypal is an intermediary; the real merchant is usually embedded in the
+    # description (PAYPAL *MERCHANTNAME) and gets extracted at normalize time.
+    # When the merchant can't be extracted, the payee lands here as "Paypal"
+    # and the Categorize UI blocks category assignment until the user changes
+    # it to the real payee.
+    "Paypal",
 })
 
 
