@@ -177,6 +177,123 @@ def normalize_page(conn):
 # Payee Normalization
 # ---------------------------------------------------------------------------
 
+def _render_auto_near_miss(conn):
+    """After a Payee Normalization Commit All, automatically check whether any
+    of the newly-committed payee names look like near-miss duplicates of
+    existing ones (e.g. 'Martha and Sons' vs 'Martha & Sons'). Uses the
+    existing Claude near-miss detector, scoped to groups that contain at least
+    one newly-committed name.
+
+    Session-state keys used (all scoped to this widget):
+      norm_new_payees      list[str] set by Commit All; drives the check.
+      norm_nm_status       "pending" | "done"
+      norm_nm_groups       list[dict] of filtered groups
+      norm_nm_dismissed    set[int] of resolved group indices
+    """
+    import os
+    new_payees = st.session_state.get("norm_new_payees")
+    if not new_payees:
+        return
+
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        # Nothing else to do if the key isn't set. Silently drop the trigger —
+        # user can still use the manual near-miss check on Maintenance later.
+        st.session_state.pop("norm_new_payees", None)
+        return
+
+    status = st.session_state.get("norm_nm_status", "pending")
+
+    if status == "pending":
+        with st.spinner(f"Checking {len(new_payees)} new payee(s) for near-miss duplicates..."):
+            try:
+                from processing.ai_near_miss import find_near_miss_groups
+                all_groups, _warnings = find_near_miss_groups(conn)
+            except Exception as e:
+                st.error(f"Near-miss check failed: {type(e).__name__}: {e}")
+                st.session_state.pop("norm_new_payees", None)
+                return
+        # Keep only groups that contain a newly-added payee — the rest are
+        # pre-existing duplicates the user can catch via the manual tool.
+        new_set = set(new_payees)
+        filtered = [g for g in all_groups if any(m in new_set for m in g.members)]
+        st.session_state["norm_nm_groups"] = [g.model_dump() for g in filtered]
+        st.session_state["norm_nm_dismissed"] = set()
+        st.session_state["norm_nm_status"] = "done"
+        st.rerun()
+
+    # status == "done": render results
+    groups = st.session_state.get("norm_nm_groups", [])
+    dismissed = st.session_state.get("norm_nm_dismissed", set())
+    active = [(i, g) for i, g in enumerate(groups) if i not in dismissed]
+
+    with st.container(border=True):
+        if not groups:
+            st.success(
+                "✓ Near-miss duplicate check ran. No look-alike payees found "
+                f"among the {len(new_payees)} newly-committed name(s)."
+            )
+        elif not active:
+            st.success(
+                f"✓ All {len(groups)} near-miss group(s) resolved."
+            )
+        else:
+            st.markdown(
+                f"**⚠ {len(active)} of {len(groups)} near-miss group(s) still "
+                f"to resolve** — pick one canonical name per group and Merge, "
+                f"or Keep Separate if they really are different."
+            )
+
+            # Payee counts for context
+            counts = dict(conn.execute(
+                "SELECT payee, COUNT(*) FROM transactions "
+                "WHERE payee IS NOT NULL GROUP BY payee"
+            ).fetchall())
+
+            # Import at use to avoid a circular top-level import between UI modules
+            from ui.maintenance import _execute_rename
+
+            for i, g in active:
+                members = g["members"]
+                canonical_default = g["canonical"]
+                with st.container(border=True):
+                    conf_color = "green" if g.get("confidence") == "high" else "orange"
+                    st.markdown(
+                        f"**Group {i+1}** — confidence: :{conf_color}[{g.get('confidence', '?')}]"
+                    )
+                    st.caption(g.get("reasoning", ""))
+                    for m in members:
+                        cnt = counts.get(m, 0)
+                        marker = "→ canonical" if m == canonical_default else ""
+                        st.write(f"  - **{m}** ({cnt} txns) {marker}")
+                    canonical_choice = st.selectbox(
+                        "Merge all into:", members,
+                        index=members.index(canonical_default),
+                        key=f"norm_nm_canonical_{i}",
+                    )
+                    col_m, col_l, _ = st.columns([1, 1, 3])
+                    if col_m.button("Merge", type="primary", key=f"norm_nm_merge_{i}"):
+                        for m in members:
+                            if m == canonical_choice:
+                                continue
+                            _execute_rename(conn, m, canonical_choice)
+                        dismissed.add(i)
+                        st.session_state["norm_nm_dismissed"] = dismissed
+                        st.rerun()
+                    if col_l.button("Keep separate", key=f"norm_nm_leave_{i}"):
+                        dismissed.add(i)
+                        st.session_state["norm_nm_dismissed"] = dismissed
+                        st.rerun()
+
+        if not active:
+            if st.button("Dismiss near-miss check", key="norm_nm_dismiss_all"):
+                for k in ("norm_new_payees", "norm_nm_status",
+                          "norm_nm_groups", "norm_nm_dismissed"):
+                    st.session_state.pop(k, None)
+                st.rerun()
+
+    st.divider()
+
+
 def _render_check_required_block(check_items: list[dict]):
     """Render the required-first block of check rows lacking a payee.
 
@@ -219,6 +336,10 @@ def _render_check_required_block(check_items: list[dict]):
 
 def _normalization(conn):
     st.subheader("Payee Normalization")
+
+    # If we just committed new payees, auto-check for near-miss duplicates
+    # (renders inline when relevant; no-op otherwise).
+    _render_auto_near_miss(conn)
 
     # Seed starter rules on first ever run
     if "norm_seeded" not in st.session_state:
@@ -362,6 +483,10 @@ def _normalization(conn):
                     help=disabled_reason):
         committed = 0
         skipped = 0
+        # Collect the set of newly-committed payee names so the auto near-miss
+        # check on the next render can scope itself to just these (cheaper +
+        # more relevant than scanning the whole payee list).
+        new_names: set[str] = set()
 
         # Check rows: NEVER create a normalization rule (dead-on-arrival —
         # the description is unique per check number). Just set the payee and
@@ -376,6 +501,7 @@ def _normalization(conn):
             for tid in ci["ids"]:
                 queries.update_transaction(conn, tid, payee=name)
                 _append_audit_note(conn, tid, "[payee entered manually]")
+            new_names.add(name)
             committed += 1
             st.session_state.pop(f"check_payee_field_{i}", None)
 
@@ -395,12 +521,20 @@ def _normalization(conn):
                 if via:
                     updates["via"] = via
                 queries.update_transaction(conn, tid, **updates)
+            new_names.add(name)
             committed += 1
 
         # Clear the in-field session state so a re-scan starts clean
         for idx in range(len(display_items)):
             st.session_state.pop(f"payee_field_{idx}", None)
         st.session_state.pop("norm_run", None)
+
+        # Trigger the auto near-miss check on the next render, scoped to just
+        # what we committed. Cleared once the user resolves the results.
+        if new_names:
+            st.session_state["norm_new_payees"] = sorted(new_names)
+            st.session_state["norm_nm_status"] = "pending"
+
         msg = f"Committed {committed} payee(s)."
         if skipped:
             msg += f" Skipped {skipped} row(s) with empty name."
