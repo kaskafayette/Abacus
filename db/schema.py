@@ -119,14 +119,16 @@ CREATE TABLE IF NOT EXISTS non_cash_donations (
 );
 """
 
-# Special-source seeds inserted on first init. Venmo is now a first-class
-# checking-style source (its own ingest path in processing/ingest.py handles
-# the Venmo statement CSV format). Amazon remains an enrichment source until
-# the item-level parser is built.
+# Special-source seeds inserted on first init. Venmo and Fidelity8870 are
+# first-class checking-style sources with their own ingest paths (see
+# processing/venmo_ingest.py and processing/fidelity_ingest.py) since their
+# statement CSVs don't fit the generic column-template pattern. Amazon
+# remains an enrichment source until the item-level parser is built.
 SEED_ENRICHMENT_SOURCES = [
     # (source_prefix, source_label, nickname, account_type)
-    ("Venmo",  "Venmo",  "Venmo (shared)",  "checking"),
-    ("Amazon", "Amazon", "Amazon (shared)", "amazon_detail"),
+    ("Venmo",        "Venmo",        "Venmo (shared)",       "checking"),
+    ("Fidelity8870", "Fidelity8870", "Fidelity brokerage",   "checking"),
+    ("Amazon",       "Amazon",       "Amazon (shared)",      "amazon_detail"),
 ]
 
 # Seed data: the full category taxonomy from the spec.

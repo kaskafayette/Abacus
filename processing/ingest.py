@@ -126,12 +126,11 @@ def _validate_one(conn: sqlite3.Connection, filepath: Path,
         result.is_enrichment = True
         return result
 
-    # Venmo is a first-class checking-style source but its statement CSV has
-    # banner rows and balance markers that the generic column-template parser
-    # can't handle. Its own parser lives in processing/venmo_ingest.py, so we
-    # short-circuit the template requirement here.
-    if prefix.lower() == "venmo":
-        result.template = None  # signals the Venmo path
+    # Special-parser sources: their statement CSVs don't fit the generic
+    # column-template parser (banner rows / balance markers / disclaimers).
+    # Route them by prefix and skip the template requirement.
+    if prefix.lower() == "venmo" or prefix.lower().startswith("fidelity"):
+        result.template = None  # signals the special-parser path
         _check_continuity(conn, result, parsed, prefix, template=None)
         return result
 
@@ -379,6 +378,9 @@ def ingest_file(conn: sqlite3.Connection, filepath: Path,
     if prefix.lower() == "venmo":
         from processing.venmo_ingest import parse_venmo_transactions
         transactions = parse_venmo_transactions(filepath)
+    elif prefix.lower().startswith("fidelity"):
+        from processing.fidelity_ingest import parse_fidelity_transactions
+        transactions = parse_fidelity_transactions(filepath, source=prefix)
     else:
         transactions = parse_file_with_template(filepath, template, conn)
 

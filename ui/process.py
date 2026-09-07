@@ -231,9 +231,10 @@ def _commit_ingestion(conn):
         if not filepath.exists():
             continue
         prefix = r.parsed["prefix"]
-        # Venmo has its own parser (statement CSV — banner rows etc.) and
-        # doesn't need a column template.
-        if prefix.lower() == "venmo":
+        # Special-parser sources (Venmo, Fidelity8870, ...) don't use a
+        # column template — their statement CSVs have banner rows and other
+        # oddities handled by dedicated parsers in processing/.
+        if prefix.lower() == "venmo" or prefix.lower().startswith("fidelity"):
             template = None
         else:
             template = r.template or queries.get_column_template(conn, prefix)
