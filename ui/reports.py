@@ -156,7 +156,10 @@ def _proceed_or_gate(conn, start_str: str, end_str: str, mode: str,
 def reports_page(conn):
     st.title("Reports")
 
-    tab1, tab2, tab3 = st.tabs(["Monthly Report", "Ad-Hoc Report", "Excel Export"])
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Monthly Report", "Ad-Hoc Report", "Interactive Category Summary",
+        "Excel Export",
+    ])
 
     with tab1:
         _monthly_report(conn)
@@ -165,6 +168,9 @@ def reports_page(conn):
         _adhoc_reports(conn)
 
     with tab3:
+        _interactive_category_summary(conn)
+
+    with tab4:
         _excel_export(conn)
 
 
@@ -296,6 +302,124 @@ def _adhoc_reports(conn):
             st.success(f"Report generated: `{path}`")
         except Exception as e:
             st.error(f"Report generation failed: {e}")
+
+
+def _interactive_category_summary(conn):
+    """Read-only, expandable drill-down of the Category Summary on screen.
+
+    Category -> Subcategory -> Payee -> individual transactions, all in one
+    AG Grid via native row grouping. No PDF, no edits — read-only view.
+    Matches the PDF Category Summary's exclusions: split parents skipped
+    (their legs are counted), Transfer category excluded (net-zero, not real
+    spending).
+    """
+    st.subheader("Interactive Category Summary")
+    st.caption(
+        "Click the triangle beside any row to drill down: "
+        "**Category → Subcategory → Payee → Transactions**. "
+        "Amounts aggregate up at each level; credits render in green. "
+        "Read-only — no risk of accidentally editing a transaction."
+    )
+
+    default_start, default_end = _get_date_range(conn)
+    col1, col2 = st.columns(2)
+    start = col1.date_input("From", value=default_start, key="ics_start")
+    end = col2.date_input("To", value=default_end, key="ics_end")
+    if start > end:
+        st.error("From date must be before To date.")
+        return
+    start_str, end_str = start.isoformat(), end.isoformat()
+
+    mode = _scope_selector("ics_mode")
+
+    # Fetch mode-filtered, parent-excluded transactions (matches PDF fetch)
+    from processing.reports import _fetch_month_transactions
+    txns = _fetch_month_transactions(conn, start_str, end_str, mode=mode)
+
+    # Match PDF Category Summary behavior — Transfer is excluded (net-zero
+    # movement between our own accounts, not real spending/income).
+    txns_no_xfer = [t for t in txns if (t.get("category") or "") != "Transfer"]
+    n_xfer = len(txns) - len(txns_no_xfer)
+
+    if not txns_no_xfer:
+        st.info(f"No transactions in scope ({MODE_LABELS[mode]}) in this "
+                f"range (Transfers excluded).")
+        return
+
+    st.caption(
+        f"**{len(txns_no_xfer)}** transaction(s) shown "
+        f"({MODE_LABELS[mode]}). "
+        f"{n_xfer} Transfer row(s) excluded from the summary."
+    )
+
+    # Build the flat dataframe — grouping happens client-side in AG Grid.
+    import pandas as pd
+    rows = []
+    for t in txns_no_xfer:
+        rows.append({
+            "Category":    t.get("category") or "(uncategorized)",
+            "Subcategory": t.get("subcategory") or "(none)",
+            "Payee":       t.get("payee") or "(no payee)",
+            "Date":        t.get("date"),
+            "Amount":      float(t["amount"]),
+            "Source":      t.get("source") or "",
+            "Description": t.get("description_raw") or "",
+            "Note":        t.get("note") or "",
+        })
+    df = pd.DataFrame(rows)
+
+    # AG Grid with row grouping — one tree column, expandable at each level.
+    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+    from ui._amount_style import amount_cell_style, amount_value_formatter
+
+    gb = GridOptionsBuilder.from_dataframe(df)
+    # Everything read-only, sortable + filterable (search box on each column).
+    gb.configure_default_column(
+        resizable=True, sortable=True, editable=False, filter=True,
+        suppressMenu=False,
+    )
+    # The three grouping levels — hide their raw columns (their values appear
+    # inside the auto-generated tree column instead).
+    gb.configure_column("Category",    rowGroup=True, hide=True)
+    gb.configure_column("Subcategory", rowGroup=True, hide=True)
+    gb.configure_column("Payee",       rowGroup=True, hide=True)
+    # Amount aggregates up as a sum. Green-for-positive styling applies to
+    # both leaf rows and group aggregations.
+    gb.configure_column(
+        "Amount", type=["numericColumn"], aggFunc="sum",
+        valueFormatter=amount_value_formatter(),
+        cellStyle=amount_cell_style(),
+        width=130,
+    )
+    gb.configure_column("Date", width=105)
+    gb.configure_column("Source", width=110)
+    gb.configure_column("Description", width=280)
+    gb.configure_column("Note", width=180)
+
+    gb.configure_grid_options(
+        groupDisplayType="singleColumn",  # one tree column, classic drill-down
+        autoGroupColumnDef={
+            "headerName": "Category / Subcategory / Payee",
+            "minWidth": 380,
+            "cellRendererParams": {"suppressCount": False},  # show child count
+        },
+        animateRows=True,
+        suppressAggFuncInHeader=True,   # header just says "Amount", not "sum(Amount)"
+        groupDefaultExpanded=0,          # start fully collapsed
+    )
+
+    AgGrid(
+        df,
+        gridOptions=gb.build(),
+        update_mode=GridUpdateMode.NO_UPDATE,   # read-only; no callback churn
+        allow_unsafe_jscode=True,
+        fit_columns_on_grid_load=True,
+        height=650,
+        # Row grouping (rowGroup) is an AG Grid Enterprise feature. This flag
+        # loads the Enterprise bundle in evaluation mode — fine for personal
+        # non-commercial use; a small watermark may appear.
+        enable_enterprise_modules=True,
+    )
 
 
 def _excel_export(conn):
