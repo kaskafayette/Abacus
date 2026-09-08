@@ -995,9 +995,14 @@ def _edit_transactions(conn):
     gb = GridOptionsBuilder.from_dataframe(df)
     gb.configure_default_column(resizable=True, sortable=True, editable=False,
                                 comparator=case_insensitive_comparator())
-    gb.configure_grid_options(singleClickEdit=True,
-                              stopEditingWhenCellsLoseFocus=True,
-                              getRowStyle=split_row_style)
+    gb.configure_grid_options(
+        singleClickEdit=True,
+        stopEditingWhenCellsLoseFocus=True,
+        getRowStyle=split_row_style,
+        # Label the selection-checkbox column so it reads as "tick this to
+        # split" rather than a blank column that looks like a multi-select.
+        selectionColumnDef={"headerName": "split", "width": 70, "pinned": "left"},
+    )
     gb.configure_column("id", width=50)
     gb.configure_column("split_role", hide=True)
     gb.configure_column("Date", width=95)
