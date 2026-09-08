@@ -627,6 +627,16 @@ Concrete work that's queued and committed — has a clear path, just hasn't been
 
     **(c) Cosmetic:** for check rows with no embedded payee (bare `CHECK 1002`), blank the useless `Check` suggestion so it's obvious the user has to look at their check register, and consider rendering the Description column as `Check #1002` so the check number reads clearly.
 
+15. **Status / completeness model needs simplification.** The current design conflates two orthogonal questions into one three-value `status` column: "have you looked at this row?" (pending vs confirmed / needs_review) and "is it fully classified?" (category present, subcategory present where required, tax flag present where a default exists). We keep discovering new "clean-looking but actually incomplete" combinations — most recently: `status='confirmed' + category='Bsns Expense NEC' + subcategory=NULL`, which shows as `(none)` in reports and was silently miscategorizing Google One and GoDaddy. Each such combination has to be plumbed into a separate data-quality helper (`get_unconfirmed_count`, `get_missing_subcategory_count`, ...) and surfaced in every anti-illusion banner (sidebar, Home, PDF page 1, Interactive report). That's not sustainable — the combinatorial space of `(status × has_category × has_subcategory × has_tax_flag × has_payor × ...)` grows every time we add a required field.
+
+    Directions to consider (no decision yet):
+      - **Collapse to 2 statuses** (`pending` / `confirmed`) and move `needs_review` to a separate boolean `flagged` bit. Two orthogonal fields with clear meaning: status = "did you look?", flagged = "did you set aside for follow-up?".
+      - **Add a derived `completeness` flag** on read, computed from (category != NULL) AND (subcategory != NULL when required) AND (tax_flag != NULL when a default exists). Reports and banners then check one thing, not five.
+      - **Rethink status as a workflow-step field** (imported → categorized → confirmed → filed) with explicit transitions, so every row's state is unambiguous.
+      - **Or something else** — the point is that the current model was OK for one class of "not done" (status), got extended for another class (missing subcategory), and will keep sprouting more. Worth a fresh design pass rather than more bolt-ons.
+
+    Not urgent — the current anti-illusion surfaces work — but the friction will grow every time we add a required field. Revisit with fresh eyes.
+
 ---
 
 ## Future Enhancements (longer-horizon, no firm commitment)
