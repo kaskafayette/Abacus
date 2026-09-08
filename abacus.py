@@ -20,17 +20,21 @@ def main():
     st.sidebar.title("Abacus")
     st.sidebar.caption(f"Database: {DB_PATH.name}")
 
-    # Global unresolved count (pending + needs_review, split parents excluded).
-    # Shown persistently in the sidebar so a scoped "0 unconfirmed" in one
-    # report can never create the illusion the whole ledger is clean.
+    # Anti-illusion: sidebar shows GLOBAL data-quality warnings —
+    # unresolved (pending/needs_review) AND missing-subcategory rows.
+    # Persistent across every page so a scoped "0 unconfirmed" can never
+    # create the illusion the whole ledger is clean.
     unc_count, unc_abs = queries.get_unconfirmed_count(conn)
-    if unc_count > 0:
-        st.sidebar.warning(
-            f"⚠ **{unc_count}** transaction(s) unresolved "
-            f"(${float(unc_abs):,.0f} abs) — pending or needs_review"
-        )
+    ms_count, ms_abs = queries.get_missing_subcategory_count(conn)
+    if unc_count > 0 or ms_count > 0:
+        parts = []
+        if unc_count:
+            parts.append(f"{unc_count} unresolved (${float(unc_abs):,.0f})")
+        if ms_count:
+            parts.append(f"{ms_count} missing-subcat (${float(ms_abs):,.0f})")
+        st.sidebar.warning("⚠ " + " · ".join(parts))
     else:
-        st.sidebar.success("✓ 0 unresolved transactions")
+        st.sidebar.success("✓ 0 unresolved · 0 missing-subcat")
     # Kept for backward-compat callers that still reference pending_count.
     pending_count = queries.get_pending_count(conn)
 
@@ -74,19 +78,31 @@ def _home_page(conn, pending_count):
     else:
         st.success(f"Using existing database: {DB_PATH.name}")
 
-    # Anti-illusion prominent warning: any unresolved (pending or needs_review)
-    # rows, regardless of month, so the reader knows the ledger isn't finished.
+    # Anti-illusion: prominent warning about global data-quality issues.
+    # Covers BOTH unresolved status AND missing-subcategory rows — either
+    # class is a way the ledger could look done but not be.
     unc_count, unc_abs = queries.get_unconfirmed_count(conn)
-    if unc_count > 0:
-        st.warning(
-            f"**⚠ {unc_count}** transactions across the entire database are "
-            f"NOT yet confirmed (status = pending or needs_review), totaling "
-            f"**${float(unc_abs):,.2f}** in absolute value. Go to "
-            f"**Normalize & Categorize** to work through them."
-        )
+    ms_count, ms_abs = queries.get_missing_subcategory_count(conn)
+    if unc_count > 0 or ms_count > 0:
+        parts = []
+        if unc_count > 0:
+            parts.append(
+                f"- **{unc_count}** transactions unresolved (pending or "
+                f"needs_review), ${float(unc_abs):,.2f} absolute value — "
+                f"work through them on **Normalize & Categorize**."
+            )
+        if ms_count > 0:
+            parts.append(
+                f"- **{ms_count}** transactions have a category but no "
+                f"subcategory where one is required, ${float(ms_abs):,.2f} "
+                f"absolute value — fix them on **Maintenance → Edit "
+                f"Transactions** (they look done but aren't fully classified)."
+            )
+        st.warning("**⚠ Ledger is not clean:**\n\n" + "\n".join(parts))
     else:
         st.success(
-            "✓ All transactions are confirmed. Nothing pending or needing review."
+            "✓ Ledger is clean — every transaction is confirmed AND fully "
+            "categorized (no missing subcategories)."
         )
 
     # Database stats

@@ -1018,22 +1018,32 @@ def _write_top_banners(pdf: AbacusPDF, conn: sqlite3.Connection,
                   f"{_fmt_amt(nf_total)} that are not yet confirmed.")
     pdf.cell(0, 5, _safe(banner), new_x="LMARGIN", new_y="NEXT")
 
-    # GLOBAL line — always printed. This is the anti-illusion guard: even
-    # when the report's period is fully clean (in-scope count == 0), we
-    # still surface any unresolved items sitting in OTHER months so the
-    # reader is never fooled into thinking the whole ledger is finished.
+    # GLOBAL data-quality line — always printed. Anti-illusion guard: even
+    # when the report's period is fully clean, we still surface any unresolved
+    # OR missing-subcategory items across the entire DB so the reader is
+    # never fooled into thinking the ledger is finished.
     global_cnt, global_abs = queries.get_unconfirmed_count(conn)
-    if global_cnt == 0:
+    missing_cnt, missing_abs = queries.get_missing_subcategory_count(conn)
+    if global_cnt == 0 and missing_cnt == 0:
         pdf.set_font("Helvetica", "I", 9)
-        line = "Across the entire database: 0 unresolved transactions (nothing pending/needs_review)."
+        line = ("Across the entire database: 0 unresolved and 0 "
+                "missing-subcategory transactions — ledger is clean.")
         pdf.set_text_color(0, 130, 0)  # green
+        pdf.cell(0, 5, _safe(line), new_x="LMARGIN", new_y="NEXT")
     else:
         pdf.set_font("Helvetica", "B", 9)
-        line = (f"Across the ENTIRE database: {global_cnt} unresolved "
-                f"transaction(s) totaling ${float(global_abs):,.2f} (absolute value) "
-                f"still to review — regardless of this report's date range.")
         pdf.set_text_color(180, 0, 0)  # red
-    pdf.cell(0, 5, _safe(line), new_x="LMARGIN", new_y="NEXT")
+        if global_cnt > 0:
+            line = (f"Across the ENTIRE database: {global_cnt} unresolved "
+                    f"transaction(s) totaling ${float(global_abs):,.2f} (abs) "
+                    f"still to review — regardless of this report's date range.")
+            pdf.cell(0, 5, _safe(line), new_x="LMARGIN", new_y="NEXT")
+        if missing_cnt > 0:
+            line = (f"Across the ENTIRE database: {missing_cnt} transaction(s) "
+                    f"totaling ${float(missing_abs):,.2f} (abs) have a category "
+                    f"but no subcategory where one is required — fix on "
+                    f"Maintenance -> Edit Transactions.")
+            pdf.cell(0, 5, _safe(line), new_x="LMARGIN", new_y="NEXT")
     pdf.set_text_color(0, 0, 0)
 
     # Missing-payee warning (only if any in-scope rows have NULL payee)

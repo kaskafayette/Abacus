@@ -314,6 +314,43 @@ def get_pending_count(conn: sqlite3.Connection) -> int:
     return row["cnt"]
 
 
+def category_requires_subcategory(conn: sqlite3.Connection, category: str | None) -> bool:
+    """True when the given category has at least one non-empty subcategory
+    defined in the categories master. Used to block saves that pick a category
+    like 'Medical' but leave subcategory blank when there ARE subcategories
+    (Doctors and Dentists, Therapists, ...) to choose from."""
+    if not category:
+        return False
+    r = conn.execute(
+        "SELECT 1 FROM categories WHERE category = ? "
+        "AND subcategory IS NOT NULL AND subcategory != '' LIMIT 1",
+        (category,),
+    ).fetchone()
+    return r is not None
+
+
+def get_missing_subcategory_count(conn: sqlite3.Connection) -> tuple[int, Decimal]:
+    """Global count + abs sum of rows whose category HAS subcategories defined
+    but the row's subcategory is NULL/empty. These rows look 'clean' (confirmed
+    with a category set) but are actually incomplete. Split parents excluded."""
+    cats = [r["category"] for r in conn.execute(
+        "SELECT DISTINCT category FROM categories "
+        "WHERE subcategory IS NOT NULL AND subcategory != ''"
+    ).fetchall()]
+    if not cats:
+        return 0, Decimal(0)
+    placeholders = ",".join("?" * len(cats))
+    row = conn.execute(
+        f"SELECT COUNT(*) AS cnt, COALESCE(SUM(ABS(amount)), 0) AS total "
+        f"FROM transactions "
+        f"WHERE category IN ({placeholders}) "
+        f"AND (subcategory IS NULL OR subcategory = '') "
+        f"AND {NOT_PARENT_SQL}",
+        tuple(cats),
+    ).fetchone()
+    return int(row["cnt"]), Decimal(str(row["total"] or 0))
+
+
 def get_unconfirmed_count(conn: sqlite3.Connection) -> tuple[int, Decimal]:
     """Global count + absolute-value sum of every non-confirmed transaction
     across the entire database (pending or needs_review). Split parents are

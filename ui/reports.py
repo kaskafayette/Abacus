@@ -323,16 +323,25 @@ def _interactive_category_summary(conn):
     )
 
     # Anti-illusion global banner — always visible regardless of the date
-    # range chosen for this report.
+    # range chosen for this report. Covers unresolved AND missing-subcategory.
     unc_count, unc_abs = queries.get_unconfirmed_count(conn)
-    if unc_count > 0:
-        st.warning(
-            f"⚠ **{unc_count}** transaction(s) across the entire database are "
-            f"unresolved (pending or needs_review), totaling "
-            f"**${float(unc_abs):,.2f}** in absolute value. The default "
-            f"'Confirmed only' scope below **hides** them — switch scope to "
-            f"**All transactions** or **Draft only** to see them."
-        )
+    ms_count, ms_abs = queries.get_missing_subcategory_count(conn)
+    if unc_count > 0 or ms_count > 0:
+        parts = []
+        if unc_count > 0:
+            parts.append(
+                f"- **{unc_count}** unresolved transaction(s) (pending or "
+                f"needs_review), ${float(unc_abs):,.2f} abs. The default "
+                f"'Confirmed only' scope **hides** them — switch scope to "
+                f"**All transactions** or **Draft only** to see them."
+            )
+        if ms_count > 0:
+            parts.append(
+                f"- **{ms_count}** transaction(s) have a category but no "
+                f"subcategory where one is required, ${float(ms_abs):,.2f} "
+                f"abs. They appear here under `(none)` sub-groups."
+            )
+        st.warning("**⚠ Database-wide data-quality warnings:**\n\n" + "\n".join(parts))
 
     default_start, default_end = _get_date_range(conn)
     col1, col2 = st.columns(2)

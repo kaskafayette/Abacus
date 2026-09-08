@@ -837,6 +837,7 @@ def _categorization(conn):
     if col1.button("Save Categorized", type="primary"):
         saved = 0
         blocked_placeholders: set[str] = set()
+        missing_subcat_rows: list[tuple[str, str]] = []  # (payee, category)
         divergences: dict[str, tuple[str | None, str | None, str, str | None]] = {}
         for _, row in edited_df.iterrows():
             payee = row["Payee"]
@@ -858,6 +859,13 @@ def _categorization(conn):
             # categories.)
             if is_placeholder_payee(payee):
                 blocked_placeholders.add(payee)
+                continue
+
+            # BLOCK saves where category has subcategories defined but the
+            # row's subcategory is empty. Prevents rows sneaking through
+            # as "Category / (none)" when a real sub-choice was required.
+            if (not subcat) and queries.category_requires_subcategory(conn, cat):
+                missing_subcat_rows.append((payee or "(no payee)", cat))
                 continue
 
             # Check divergence against the payee's existing categorization
@@ -927,6 +935,23 @@ def _categorization(conn):
                 f"Skipped rows with placeholder payees ({names}) — change the "
                 f"payee to the real merchant on the **Rename / Merge Payees** "
                 f"tab (Maintenance) first, then come back and categorize."
+            )
+        if missing_subcat_rows:
+            # Deduplicate by (payee, category) since By-Payee mode reports one
+            # entry per row and the message reads better with one line per
+            # (payee, category) group.
+            unique = sorted(set(missing_subcat_rows))
+            lines = "\n".join(
+                f"- **{payee}** ({cat}) — choose a subcategory from the "
+                f"available list under '{cat}'." for payee, cat in unique
+            )
+            st.error(
+                "**⚠ Blocked from saving — subcategory required:**\n\n"
+                + lines +
+                "\n\nCategories like Medical or Household have subcategories "
+                "defined; the app now refuses to save a row as "
+                "`<Category> / (none)` when a real subcategory exists. Pick "
+                "one for each row above and click Save again."
             )
         if divergences:
             lines = "\n".join(

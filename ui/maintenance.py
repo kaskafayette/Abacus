@@ -957,17 +957,25 @@ def _edit_transactions(conn):
     if st.button("Save Changes", key="save_txns"):
         edited = grid_response["data"]
         skipped = 0
+        blocked_missing_subcat: list[tuple[int, str, str]] = []  # (id, payee, cat)
         for _, row in edited.iterrows():
             # Never write split parents or legs from this grid — they're edited
             # only in the Split Transaction tab, with the balance enforced.
             if row.get("split_role"):
                 skipped += 1
                 continue
+            cat = row["Category"] or None
+            subcat = row["Subcategory"] or None
+            # Block save when a real subcategory is required but missing.
+            if cat and (not subcat) and queries.category_requires_subcategory(conn, cat):
+                blocked_missing_subcat.append(
+                    (int(row["id"]), row["Payee"] or "(no payee)", cat))
+                continue
             queries.update_transaction(
                 conn, int(row["id"]),
                 payee=row["Payee"] or None,
-                category=row["Category"] or None,
-                subcategory=row["Subcategory"] or None,
+                category=cat,
+                subcategory=subcat,
                 tax_flags=row["Tax Flags"] or None,
                 payor=row["Payor"] or None,
                 note=row["Note"] or None,
@@ -977,6 +985,18 @@ def _edit_transactions(conn):
         msg = "Saved."
         if skipped:
             msg += f" ({skipped} split row(s) left untouched — edit below or in Split Transaction.)"
+        if blocked_missing_subcat:
+            lines = "\n".join(
+                f"- id={tid} — **{payee}** ({cat}): pick a subcategory."
+                for tid, payee, cat in blocked_missing_subcat
+            )
+            st.error(
+                "**⚠ Blocked from saving — subcategory required for these rows:**\n\n"
+                + lines +
+                "\n\nThe category has subcategories defined; save is refused "
+                "until you pick one. (Prevents rows landing as "
+                "`<Category> / (none)` when a real subcategory exists.)"
+            )
         st.success(msg)
         st.rerun()
 
