@@ -96,6 +96,7 @@ def _source_accounts(conn):
         update_mode=GridUpdateMode.VALUE_CHANGED,
         fit_columns_on_grid_load=True,
         height=350,
+        allow_unsafe_jscode=True,   # required for the case-insensitive comparator
     )
 
     if st.button("Save Changes", key="save_sources"):
@@ -163,6 +164,7 @@ def _payee_normalization(conn):
             update_mode=GridUpdateMode.VALUE_CHANGED,
             fit_columns_on_grid_load=True,
             height=400,
+            allow_unsafe_jscode=True,   # comparator JsCode
         )
 
         col1, col2 = st.columns(2)
@@ -304,6 +306,7 @@ def _payee_metadata(conn):
             update_mode=GridUpdateMode.VALUE_CHANGED,
             fit_columns_on_grid_load=True,
             height=400,
+            allow_unsafe_jscode=True,   # comparator + subcategory cascade JsCode
         )
 
         col1, col2 = st.columns(2)
@@ -565,6 +568,7 @@ def _category_master(conn):
             update_mode=GridUpdateMode.VALUE_CHANGED,
             fit_columns_on_grid_load=True,
             height=400,
+            allow_unsafe_jscode=True,   # comparator JsCode
         )
 
         st.warning("Editing category or subcategory names here does **not** cascade to existing transactions.")
