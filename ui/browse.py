@@ -195,12 +195,20 @@ def browse_page(conn):
     col_a.metric("Transactions", f"{len(df)}  ({len(xfer)} xfer)")
     col_b.metric("Money Out (excl. xfer)", f"-${abs(total_out):,.2f}")
     col_c.metric("Money In (excl. xfer)", f"${total_in:,.2f}")
-    # Net Transfer should be ~$0 if both legs of every transfer are captured
-    # and correctly labeled. A large positive or negative here is a
-    # data-quality signal, not real spending.
-    xfer_help = ("Should be near $0. A large value means one leg of some "
-                 "transfer isn't captured or is labeled inconsistently — "
-                 "worth investigating on Diagnostics.")
+    # Net Transfer would be ~$0 in a symmetric model where both legs of every
+    # internal move share the Transfer category. In practice this ledger is
+    # intentionally asymmetric: Fidelity -> Chase drawdowns keep the Fidelity
+    # side as Transfer but categorize the Chase-side receipt as
+    # Income / Investment Drawdown, so this metric always shows the drawdown
+    # total as a negative imbalance. Genuine miscategorizations (a deposit
+    # labeled Transfer when it's really Income, one leg missing) still show up
+    # here as movement on top of the intentional baseline.
+    xfer_help = ("Sum of the Transfer category. Non-zero is expected on this "
+                 "ledger — Fidelity -> Chase investment drawdowns are booked "
+                 "as Transfer on the Fidelity side and Income on the Chase "
+                 "side, so ~$138K of persistent negative imbalance is by "
+                 "design. Movement on top of that baseline suggests a "
+                 "miscategorized row — check Diagnostics.")
     col_d.metric("Net Transfer", f"${xfer_net:,.2f}", help=xfer_help)
 
     # --- Export buttons ---

@@ -654,7 +654,21 @@ Concrete work that's queued and committed — has a clear path, just hasn't been
 
     All three checks are heuristics, not proofs — a rule like `pattern="ACH CREDIT VANGUARD" → payee="Vanguard"` overlaps on `vanguard`, so it passes (a) even though `ACH CREDIT` is boilerplate. That's the right trade-off: (a) is the low-noise workhorse, (b) is the higher-recall catch for the specific pattern shape that failed us, and (c) closes the loop for anything already in the wild.
 
-17. **Subdivide the Health and Wellness category.** Health and Wellness is currently one of the largest categories in the ledger, which makes reports on it a wall of undifferentiated line items — no way to tell at a glance how much went to hair vs. massage vs. gym. Break it into the following subcategories:
+17. **Clean up the Fidelity → Chase asymmetric bookkeeping model.** Investment drawdowns from Fidelity8870 to Chase5616 are currently modeled asymmetrically: the Fidelity outflow row lives under `category='Transfer'` while the matching Chase inflow row lives under `category='Income', subcategory='Investment Drawdown', payee='Fidelity Transfer'`. This produces an intentional ~$138K persistent negative imbalance in the Transfer category (roughly nine wires from 2026-02 through 2026-08) that the Browse **Net Transfer** metric surfaces as a large non-zero value.
+
+    Two things about the current model are working correctly:
+      - The Chase-side row's Income classification means the money shows up as available spending (right, because that's what a drawdown is for the household).
+      - The Fidelity-side row's Transfer classification keeps it out of the Money Out totals on Browse and the PDF reports (right, because it isn't real spending — it's a movement between accounts).
+
+    But the asymmetry means the Transfer bucket can never balance to zero, so the Net Transfer diagnostic on Browse is dominated by this baseline and has to carry a "non-zero is expected" tooltip that's not really the point of the metric. A cleaner design would either:
+
+      - **Model A — Both sides Transfer.** Add a separate "Investment Drawdown Received" tracker (payor-report style) that pulls receipts from Fidelity Transfer rows, so drawdowns still show up as income-like on the report but the raw category is Transfer on both sides. Net Transfer would then be a real data-quality signal (near zero when clean).
+      - **Model B — Both sides Income.** Fidelity outflow becomes `Income / Investment Drawdown` too (with sign). Both rows sum to net zero on Income, so income totals don't double-count. Money Out and Money In both need to exclude the Income category for drawdown rows, or exclude by payee `Fidelity Transfer`.
+      - **Model C — Keep the asymmetry but split-parent the pair.** Treat each drawdown as a two-leg split: parent stays for the wire, one leg is Transfer (out), one is Income (in). More overhead but bookkeeping-pure.
+
+    Not urgent — the current model is stable and the Browse tooltip explains what the reader is seeing — but worth a design pass before the next tax-preparation cycle.
+
+18. **Subdivide the Health and Wellness category.** Health and Wellness is currently one of the largest categories in the ledger, which makes reports on it a wall of undifferentiated line items — no way to tell at a glance how much went to hair vs. massage vs. gym. Break it into the following subcategories:
 
     - **Hair** — cuts, color, styling.
     - **Nails** — manicures, pedicures.
