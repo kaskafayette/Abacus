@@ -451,7 +451,7 @@ def _interactive_category_summary(conn):
     }
 
     # AG Grid with row grouping — one tree column, expandable at each level.
-    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
     from ui._amount_style import amount_cell_style, amount_value_formatter
 
     gb = GridOptionsBuilder.from_dataframe(df)
@@ -482,6 +482,20 @@ def _interactive_category_summary(conn):
     # explicit via the button below the grid — no auto-save.
     gb.configure_column("Note", width=200, editable=True)
 
+    # When a group is expanded, scroll the grid so THAT group's own header
+    # sits at the top of the viewport. Its children (leaves or sub-groups)
+    # then render below, in full view — no more "sticky group headers
+    # hide the first three leaves" illusion that had us wondering where
+    # the January State Farm rows went.
+    on_row_group_opened = JsCode("""
+        function(event) {
+            if (!event.expanded) return;      // ignore collapses
+            var node = event.node;
+            if (!node) return;
+            event.api.ensureNodeVisible(node, 'top');
+        }
+    """)
+
     gb.configure_grid_options(
         groupDisplayType="singleColumn",  # one tree column, classic drill-down
         autoGroupColumnDef={
@@ -495,6 +509,7 @@ def _interactive_category_summary(conn):
         headerHeight=32,                 # ensure column-header row is visible
         singleClickEdit=True,            # one click into the Note cell to edit
         stopEditingWhenCellsLoseFocus=True,
+        onRowGroupOpened=on_row_group_opened,
     )
 
     grid_response = AgGrid(
@@ -511,7 +526,10 @@ def _interactive_category_summary(conn):
         key="ics_grid",
         allow_unsafe_jscode=True,
         fit_columns_on_grid_load=True,
-        height=650,
+        # 800px fits ~14 leaves at a glance, so a typical group renders in
+        # full without needing an internal scroll (which combined with
+        # AG Grid's sticky group headers hid rows above the viewport).
+        height=800,
         theme="alpine-dark",             # explicit dark theme; makes headers pop
         # Row grouping (rowGroup) is an AG Grid Enterprise feature. This flag
         # loads the Enterprise bundle in evaluation mode — fine for personal
