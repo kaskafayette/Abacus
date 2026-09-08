@@ -861,12 +861,18 @@ def _categorization(conn):
                 blocked_placeholders.add(payee)
                 continue
 
-            # BLOCK saves where category has subcategories defined but the
-            # row's subcategory is empty. Prevents rows sneaking through
-            # as "Category / (none)" when a real sub-choice was required.
-            if (not subcat) and queries.category_requires_subcategory(conn, cat):
+            # SOFT gate for missing-subcategory rows. Rather than blocking
+            # the save (which is annoying when it's just sloppiness), we
+            # save the row's category + other fields, but:
+            #   - keep status='pending' so the row STAYS on this tab, and
+            #   - skip the payee_metadata write so we don't propagate the
+            #     incomplete mapping to future ingests.
+            # After the loop, an inline error surfaces every affected
+            # (payee, category) pair so the user can pick the sub and save
+            # again — right there, no page navigation needed.
+            row_missing_subcat = (not subcat) and queries.category_requires_subcategory(conn, cat)
+            if row_missing_subcat:
                 missing_subcat_rows.append((payee or "(no payee)", cat))
-                continue
 
             # Check divergence against the payee's existing categorization
             # BEFORE writing this row — catches "I just categorized Emmi
@@ -888,6 +894,10 @@ def _categorization(conn):
                 elif (cat, None) in tax_defaults_map:
                     tax = tax_defaults_map[(cat, None)]
 
+            # Missing-subcategory rows stay pending so they remain visible
+            # on this tab for the follow-up save.
+            target_status = "pending" if row_missing_subcat else "confirmed"
+
             if view_mode == "By Transaction" and "_id" in row:
                 # Update just this one transaction
                 queries.update_transaction(
@@ -897,7 +907,7 @@ def _categorization(conn):
                     tax_flags=tax or None,
                     payor=payor or None,
                     note=note or None,
-                    status="confirmed",
+                    status=target_status,
                     overridden=1,
                 )
             else:
@@ -911,12 +921,14 @@ def _categorization(conn):
                         tax_flags=tax or None,
                         payor=payor or None,
                         note=note or None,
-                        status="confirmed",
+                        status=target_status,
                         overridden=1,
                     )
 
-            # Save payee default
-            if payee != "(no payee)":
+            # Save payee default ONLY when the row is fully categorized.
+            # Otherwise we'd propagate an incomplete Category/(none) mapping
+            # to every future ingested transaction for this payee.
+            if payee != "(no payee)" and not row_missing_subcat:
                 save_payee_defaults(conn, [{
                     "normalized_name": payee,
                     "category": cat,
@@ -942,16 +954,15 @@ def _categorization(conn):
             # (payee, category) group.
             unique = sorted(set(missing_subcat_rows))
             lines = "\n".join(
-                f"- **{payee}** ({cat}) — choose a subcategory from the "
-                f"available list under '{cat}'." for payee, cat in unique
+                f"- **{payee}** ({cat}) — pick a subcategory."
+                for payee, cat in unique
             )
             st.error(
-                "**⚠ Blocked from saving — subcategory required:**\n\n"
+                "**⚠ Saved the category, but still need a subcategory for "
+                "these rows:**\n\n"
                 + lines +
-                "\n\nCategories like Medical or Household have subcategories "
-                "defined; the app now refuses to save a row as "
-                "`<Category> / (none)` when a real subcategory exists. Pick "
-                "one for each row above and click Save again."
+                "\n\nThey stayed as **pending** so they're still visible above. "
+                "Pick a subcategory for each and click Save again to finish."
             )
         if divergences:
             lines = "\n".join(

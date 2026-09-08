@@ -957,7 +957,7 @@ def _edit_transactions(conn):
     if st.button("Save Changes", key="save_txns"):
         edited = grid_response["data"]
         skipped = 0
-        blocked_missing_subcat: list[tuple[int, str, str]] = []  # (id, payee, cat)
+        missing_subcat_flagged: list[tuple[int, str, str]] = []  # (id, payee, cat)
         for _, row in edited.iterrows():
             # Never write split parents or legs from this grid — they're edited
             # only in the Split Transaction tab, with the balance enforced.
@@ -966,11 +966,13 @@ def _edit_transactions(conn):
                 continue
             cat = row["Category"] or None
             subcat = row["Subcategory"] or None
-            # Block save when a real subcategory is required but missing.
+            # Save the field changes regardless — but if the row's category
+            # requires a subcategory and one wasn't picked, flag it in the
+            # warning list below so the user can go finish it (usually just
+            # sloppiness, not something needing research).
             if cat and (not subcat) and queries.category_requires_subcategory(conn, cat):
-                blocked_missing_subcat.append(
+                missing_subcat_flagged.append(
                     (int(row["id"]), row["Payee"] or "(no payee)", cat))
-                continue
             queries.update_transaction(
                 conn, int(row["id"]),
                 payee=row["Payee"] or None,
@@ -985,17 +987,17 @@ def _edit_transactions(conn):
         msg = "Saved."
         if skipped:
             msg += f" ({skipped} split row(s) left untouched — edit below or in Split Transaction.)"
-        if blocked_missing_subcat:
+        if missing_subcat_flagged:
             lines = "\n".join(
                 f"- id={tid} — **{payee}** ({cat}): pick a subcategory."
-                for tid, payee, cat in blocked_missing_subcat
+                for tid, payee, cat in missing_subcat_flagged
             )
             st.error(
-                "**⚠ Blocked from saving — subcategory required for these rows:**\n\n"
+                "**⚠ Saved, but these rows still need a subcategory:**\n\n"
                 + lines +
-                "\n\nThe category has subcategories defined; save is refused "
-                "until you pick one. (Prevents rows landing as "
-                "`<Category> / (none)` when a real subcategory exists.)"
+                "\n\nThe category has real subcategories defined; pick one for "
+                "each row above and Save again. They also show up in the "
+                "missing-subcategory count on Home / Sidebar until finished."
             )
         st.success(msg)
         st.rerun()
