@@ -16,6 +16,16 @@ def main():
 
     conn = st.session_state.conn
 
+    # Pre-route flush: if the user was editing a Note in the Interactive
+    # Category Summary and clicked a sidebar radio to leave, the cell blurs
+    # (thanks to stopEditingWhenCellsLoseFocus) which commits it and fires a
+    # Streamlit rerun. On that rerun the reports page will NOT re-render, so
+    # the in-page save code would never run. Flushing here — before the
+    # sidebar radio is read and the router picks the new page — guarantees
+    # the pending edit lands in the DB either way.
+    from ui.reports import flush_ics_note_edits
+    flush_ics_note_edits(conn)
+
     # Sidebar navigation
     st.sidebar.title("Abacus")
     st.sidebar.caption(f"Database: {DB_PATH.name}")

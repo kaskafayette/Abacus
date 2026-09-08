@@ -12,6 +12,51 @@ from processing.reports import (
 )
 
 
+def flush_ics_note_edits(conn):
+    """Persist any pending note edits from the Interactive Category Summary grid.
+
+    Reads the last-known AG Grid response out of ``st.session_state["ics_grid"]``
+    (populated by the ``key="ics_grid"`` on the AgGrid call), diffs each row's
+    Note against the baseline captured when the grid was last rendered (in
+    ``st.session_state["ics_notes_baseline"]``), and writes the differences
+    to the DB with a toast per save.
+
+    Public / module-level on purpose: ``abacus.main()`` calls this BEFORE
+    routing so a cell edit that commits on blur while the user is
+    click-through-navigating away still lands in the DB (the reports page
+    won't re-render on that rerun, so the in-page flush wouldn't fire).
+
+    Idempotent: after each save the baseline is updated to the new value, so
+    calling this from both the reports page and abacus.main() in the same
+    rerun is safe.
+    """
+    grid = st.session_state.get("ics_grid")
+    baseline = st.session_state.get("ics_notes_baseline")
+    if not isinstance(grid, dict) or baseline is None:
+        return
+    data = grid.get("data")
+    if data is None:
+        return
+    try:
+        import pandas as pd
+    except ImportError:
+        return
+    for _, row in data.iterrows():
+        rid = row.get("id")
+        if pd.isna(rid):
+            continue
+        tid = int(rid)
+        if tid not in baseline:
+            continue      # row appeared in grid but wasn't part of this scope
+        new_note = (row.get("Note") or "").strip() or None
+        old_note = baseline[tid]
+        if new_note != old_note:
+            queries.update_transaction(conn, tid, note=new_note)
+            baseline[tid] = new_note
+            preview = new_note[:40] if new_note else "(cleared)"
+            st.toast(f"💾 Saved note on id={tid}: {preview}")
+
+
 def _get_date_range(conn):
     """Get the min/max transaction dates from the database for sensible defaults."""
     row = conn.execute(
@@ -318,8 +363,9 @@ def _interactive_category_summary(conn):
         "Click the triangle beside any row to drill down: "
         "**Category → Subcategory → Payee → Transactions**. "
         "Amounts aggregate up at each level; credits render in green. "
-        "Notes are editable here (see Save Note changes below the grid); "
-        "no other field is editable."
+        "**Notes auto-save** when you click out of the cell "
+        "(Ctrl-Z inside the cell to undo while editing). "
+        "No other field is editable."
     )
 
     # Anti-illusion global banner — always visible regardless of the date
@@ -395,9 +441,14 @@ def _interactive_category_summary(conn):
             "Note":        t.get("note") or "",
         })
     df = pd.DataFrame(rows)
-    # Snapshot the original notes so we can diff after edits and only write
-    # changed rows.
-    original_notes = {r["id"]: (r["Note"] or "") for r in rows if r["id"] is not None}
+    # Establish the auto-save baseline: what the DB currently holds for the
+    # `note` field of every row in scope. Cells that later differ from this
+    # baseline are written back on the next Streamlit rerun (either from the
+    # in-page flush below or from abacus.main()'s pre-route flush that catches
+    # the "user edited then clicked a sidebar radio" case).
+    st.session_state["ics_notes_baseline"] = {
+        r["id"]: (r["Note"] or None) for r in rows if r["id"] is not None
+    }
 
     # AG Grid with row grouping — one tree column, expandable at each level.
     from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
@@ -449,7 +500,15 @@ def _interactive_category_summary(conn):
     grid_response = AgGrid(
         df,
         gridOptions=gb.build(),
-        update_mode=GridUpdateMode.MODEL_CHANGED,  # returns edited data
+        # VALUE_CHANGED fires a Streamlit rerun immediately when a cell edit
+        # commits (blur / Enter / Tab), giving the flush below a chance to
+        # write the change to the DB before the user does anything else.
+        update_mode=GridUpdateMode.VALUE_CHANGED,
+        # keyed so the AG Grid response lands in st.session_state["ics_grid"]
+        # — abacus.main() reads it BEFORE routing so that a mid-edit click on
+        # a sidebar radio still saves the pending change (the reports page
+        # won't re-render on such a rerun, so the save has to happen upstream).
+        key="ics_grid",
         allow_unsafe_jscode=True,
         fit_columns_on_grid_load=True,
         height=650,
@@ -460,29 +519,14 @@ def _interactive_category_summary(conn):
         enable_enterprise_modules=True,
     )
 
-    # --- Save Note changes ---
-    col_save, col_note, _ = st.columns([1, 4, 1])
-    if col_save.button("Save Note changes", key="ics_save_notes"):
-        edited = grid_response["data"]
-        updated = 0
-        for _, row in edited.iterrows():
-            rid = row.get("id")
-            # Skip AG Grid group rows (no id) and rows with unchanged notes.
-            if pd.isna(rid):
-                continue
-            tid = int(rid)
-            new_note = (row.get("Note") or "").strip()
-            old_note = original_notes.get(tid, "")
-            if new_note != old_note:
-                queries.update_transaction(conn, tid,
-                                            note=new_note if new_note else None)
-                updated += 1
-        if updated:
-            st.success(f"Saved {updated} note change(s).")
-            st.rerun()
-        else:
-            st.info("No note changes to save.")
-    col_note.caption("Notes are editable here (the only editable field). Click **Save Note changes** to commit.")
+    # In-page flush: covers the normal case where the user stays on this
+    # page while editing (rerun fires here, we save here). The pre-route
+    # flush in abacus.main() covers the mid-edit-navigation edge case.
+    flush_ics_note_edits(conn)
+    st.caption(
+        "💾 Notes auto-save on click-away. To undo, use Ctrl-Z inside the "
+        "cell **before** clicking out, or edit the field again to overwrite."
+    )
 
 
 def _excel_export(conn):
