@@ -186,6 +186,15 @@ class AbacusPDF(FPDF):
         super().__init__(orientation="L", unit="mm", format="Letter")
         self._title = _safe(title)
         self._section: str = ""  # set by section writers; included in per-page header
+        # When a table overflows onto a new page (auto-page-break), we want the
+        # column-header row to re-draw at the top so the reader always sees
+        # what each column means. table_header / summary_header self-register
+        # a repaint callable here; header() invokes it only on auto-page-breaks
+        # (a flag set by accept_page_break() and cleared right after use), so
+        # explicit new-section pages don't accidentally redraw the previous
+        # section's table header.
+        self._repaint_table_header = None
+        self._is_auto_page_break = False
         self.set_auto_page_break(auto=True, margin=15)
 
     def set_section(self, section: str):
@@ -193,9 +202,20 @@ class AbacusPDF(FPDF):
 
         Call this right before pdf.add_page() so the new page's header picks
         up the new section. Carries over to continuation pages within the
-        same section automatically.
+        same section automatically. Also clears any registered table-header
+        repaint so a new section starts fresh.
         """
         self._section = _safe(section)
+        self._repaint_table_header = None
+
+    def _perform_page_break(self):
+        """Mark auto-page-breaks so header() knows to repeat the current
+        table's column header on the new page. Only content-overflow flows
+        through this internal fpdf2 hook; explicit add_page() calls (new
+        sections) do not — so those don't accidentally repeat the previous
+        section's table header. header() clears the flag after use."""
+        self._is_auto_page_break = True
+        return super()._perform_page_break()
 
     def header(self):
         self.set_font("Helvetica", "B", 12)
@@ -204,6 +224,14 @@ class AbacusPDF(FPDF):
             text = f"{text} — {self._section}"  # em dash separator
         self.cell(0, 8, _safe(text), new_x="LMARGIN", new_y="NEXT")
         self.ln(2)
+        # If we landed here from a content-overflow auto-page-break, redraw
+        # the current table's column header so it's visible again at the top.
+        if self._is_auto_page_break and self._repaint_table_header is not None:
+            try:
+                self._repaint_table_header()
+            except Exception:
+                pass  # never let a header-repaint error kill report generation
+        self._is_auto_page_break = False
 
     def footer(self):
         self.set_y(-10)
@@ -219,6 +247,13 @@ class AbacusPDF(FPDF):
         self.ln(2)
 
     def table_header(self, widths: list[float], headers: list[str]):
+        # Register self as the auto-page-break repaint so this column header
+        # reappears at the top of every continuation page for the table.
+        # Overrides any previously-registered repaint (each new table wins).
+        self._repaint_table_header = lambda: self._draw_table_header(widths, headers)
+        self._draw_table_header(widths, headers)
+
+    def _draw_table_header(self, widths: list[float], headers: list[str]):
         self.set_font("Helvetica", "B", 7)
         self.set_fill_color(235, 235, 235)
         for w, h in zip(widths, headers):
@@ -291,6 +326,13 @@ class AbacusPDF(FPDF):
           Row 1: <label>  |  Month (spans 2)  |  YTD (spans 2)
           Row 2: Category |  Count |  Total   |  Count |  Total
         """
+        # Self-register for repaint on auto-page-break.
+        self._repaint_table_header = lambda: self._draw_summary_header(
+            label_w, count_w, amount_w, label_title, has_ytd)
+        self._draw_summary_header(label_w, count_w, amount_w, label_title, has_ytd)
+
+    def _draw_summary_header(self, label_w, count_w, amount_w,
+                              label_title, has_ytd):
         self.set_font("Helvetica", "B", 7)
         self.set_fill_color(220, 220, 220)
         merged = count_w + amount_w
