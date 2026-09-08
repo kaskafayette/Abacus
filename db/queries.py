@@ -283,6 +283,81 @@ def delete_payee_metadata(conn: sqlite3.Connection, row_id: int) -> None:
     conn.commit()
 
 
+def check_payee_metadata_issues(conn: sqlite3.Connection) -> dict:
+    """Scan every row in payee_metadata against the categories master and
+    return a dict of the four data-quality issue classes:
+
+      - missing_category: rows with no category_override set. Category is
+        required — nothing else about a metadata row makes sense without it.
+      - missing_subcategory: rows that DO have a category but no subcategory,
+        where that category has real sub-choices in the categories master.
+        Silent for categories that were never subdivided (Transfer, ...).
+      - invalid_category: rows whose category_override isn't in the
+        categories master at all. Usually the result of a bypass edit or a
+        category later renamed/deleted.
+      - invalid_subcategory: rows whose subcategory_override isn't a valid
+        sub for the row's category. Classic case: user changed the category
+        via the picklist but forgot to update the subcategory.
+
+    Each value is a list of dicts with the metadata row plus a `reason`
+    string for display. The UI presents them in a grouped expander view.
+    """
+    metas = conn.execute(
+        "SELECT id, normalized_name, category_override, subcategory_override "
+        "FROM payee_metadata"
+    ).fetchall()
+
+    # Build the master reference: {category: set(subcategories including None)}
+    master: dict[str, set] = {}
+    for r in conn.execute("SELECT category, subcategory FROM categories").fetchall():
+        cat, sub = r["category"], r["subcategory"]
+        master.setdefault(cat, set()).add(sub if sub else None)
+    # Categories that HAVE real sub-choices: at least one non-None sub.
+    cats_with_real_subs = {c for c, subs in master.items()
+                           if any(s is not None for s in subs)}
+
+    issues = {
+        "missing_category": [],
+        "missing_subcategory": [],
+        "invalid_category": [],
+        "invalid_subcategory": [],
+    }
+    for m in metas:
+        name = m["normalized_name"]
+        cat = m["category_override"] or None
+        sub = m["subcategory_override"] or None
+
+        if cat is None:
+            issues["missing_category"].append({
+                "id": m["id"], "payee": name,
+                "reason": "no category set",
+            })
+            continue      # can't judge subcat if there's no cat
+
+        if cat not in master:
+            issues["invalid_category"].append({
+                "id": m["id"], "payee": name,
+                "category": cat, "subcategory": sub or "",
+                "reason": f"category '{cat}' isn't in the categories master",
+            })
+            continue      # invalid cat -> subcat lookup meaningless
+
+        if sub is None and cat in cats_with_real_subs:
+            issues["missing_subcategory"].append({
+                "id": m["id"], "payee": name, "category": cat,
+                "reason": f"category '{cat}' has real sub-choices",
+            })
+        elif sub is not None and sub not in master[cat]:
+            issues["invalid_subcategory"].append({
+                "id": m["id"], "payee": name, "category": cat,
+                "subcategory": sub,
+                "reason": (f"subcategory '{sub}' isn't valid for category "
+                          f"'{cat}' — likely stale after a category change"),
+            })
+
+    return issues
+
+
 # ---------------------------------------------------------------------------
 # Transactions
 # ---------------------------------------------------------------------------
