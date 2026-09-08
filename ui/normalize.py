@@ -831,6 +831,7 @@ def _categorization(conn):
     if col1.button("Save Categorized", type="primary"):
         saved = 0
         blocked_placeholders: set[str] = set()
+        divergences: dict[str, tuple[str | None, str | None, str, str | None]] = {}
         for _, row in edited_df.iterrows():
             payee = row["Payee"]
             cat = row["Category"]
@@ -847,9 +848,23 @@ def _categorization(conn):
             # intermediaries; a category set here would generalize wrongly
             # to every future placeholder row. Change the payee to the real
             # merchant on Payee Normalization / Rename & Merge first.
+            # (Skips divergence check below — placeholders legitimately span
+            # categories.)
             if is_placeholder_payee(payee):
                 blocked_placeholders.add(payee)
                 continue
+
+            # Check divergence against the payee's existing categorization
+            # BEFORE writing this row — catches "I just categorized Emmi
+            # Petersen as Medical when every prior transaction was H&W".
+            # Skips silently if no history to compare (new payee), history
+            # is already mixed, or payee is silenced in Category Consistency.
+            if payee and payee != "(no payee)":
+                prior = queries.check_payee_categorization_divergence(
+                    conn, payee, cat, subcat or None
+                )
+                if prior and payee not in divergences:
+                    divergences[payee] = (prior[0], prior[1], cat, subcat or None)
 
             # Look up tax defaults if user didn't set flags manually
             if not tax and cat:
@@ -906,6 +921,19 @@ def _categorization(conn):
                 f"Skipped rows with placeholder payees ({names}) — change the "
                 f"payee to the real merchant on the **Rename / Merge Payees** "
                 f"tab (Maintenance) first, then come back and categorize."
+            )
+        if divergences:
+            lines = "\n".join(
+                f"- **{p}**: prior `{pc}/{ps or '(none)'}` → now saving as "
+                f"`{nc}/{ns or '(none)'}`"
+                for p, (pc, ps, nc, ns) in sorted(divergences.items())
+            )
+            st.warning(
+                "**⚠ New categorization diverges from these payees' history:**\n\n"
+                + lines +
+                "\n\nIf intentional, ignore. If accidental, fix on "
+                "**Maintenance → Category Consistency** — the payee's history "
+                "is otherwise consistent, so a mismatch is usually a slip."
             )
         st.success(msg)
         st.rerun()

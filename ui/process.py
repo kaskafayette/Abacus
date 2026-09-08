@@ -260,6 +260,17 @@ def _commit_ingestion(conn):
     msg += " Scroll down to apply pending enrichments, then go to **Normalize & Categorize**."
     st.success(msg)
 
+    # Post-ingest: surface any active category-consistency conflicts so the
+    # user knows if new (or existing) rows contradict a payee's history.
+    active = {p: mix for p, mix in queries.get_multicat_payees(conn).items()
+              if not queries.is_multicat_silenced(conn, p)}
+    if active:
+        st.warning(
+            f"⚠ **{len(active)}** payee(s) currently have inconsistent "
+            f"categorization across the database. Review on "
+            f"**Maintenance → Category Consistency** to unify or silence."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Scan + route + continuity + missing-source helpers

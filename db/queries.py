@@ -690,6 +690,42 @@ def list_silenced_multicat_payees(conn: sqlite3.Connection) -> list[sqlite3.Row]
     ).fetchall()
 
 
+def check_payee_categorization_divergence(
+    conn: sqlite3.Connection, payee: str, new_cat: str | None,
+    new_subcat: str | None,
+) -> tuple[str | None, str | None] | None:
+    """Peek at a payee's history to see whether saving (new_cat, new_subcat)
+    would diverge from a previously-consistent categorization.
+
+    Returns the prior `(category, subcategory)` tuple if:
+      - the payee has prior transactions with EXACTLY one distinct
+        (category, subcategory) combo AND
+      - that combo is different from the incoming (new_cat, new_subcat).
+
+    Returns None (no warning needed) if:
+      - the payee is silenced as multi-category-expected,
+      - the payee has no prior categorized transactions (new payee),
+      - the payee already spans multiple categorizations,
+      - the incoming categorization matches history.
+
+    Split parents are excluded from the history scan.
+    """
+    if is_multicat_silenced(conn, payee):
+        return None
+    rows = conn.execute(
+        f"SELECT DISTINCT category, subcategory FROM transactions "
+        f"WHERE payee = ? AND category IS NOT NULL AND {NOT_PARENT_SQL}",
+        (payee,),
+    ).fetchall()
+    combos = {(r["category"], r["subcategory"]) for r in rows}
+    if not combos or len(combos) > 1:
+        return None
+    prior_cat, prior_subcat = next(iter(combos))
+    if (prior_cat, prior_subcat) == (new_cat, new_subcat):
+        return None
+    return (prior_cat, prior_subcat)
+
+
 def apply_canonical_category_to_payee(conn: sqlite3.Connection, payee: str,
                                        category: str, subcategory: str | None,
                                        tax_flags: str | None = None) -> int:

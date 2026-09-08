@@ -768,23 +768,26 @@ def _category_consistency(conn):
                                "up here unless un-silenced.")
                     st.rerun()
 
-    # --- Silenced-payees management ---
+    # --- Silenced-payees management (collapsed by default) ---
     st.divider()
-    st.subheader("Currently silenced")
-    if not silenced_rows:
-        st.caption("None. Click **Ignore this payee** above to silence "
-                   "expected multi-category payees like Amazon.")
+    n_silenced = len(silenced_rows)
+    if n_silenced == 0:
+        st.caption("**0 silenced payee(s).** Click **Ignore this payee** "
+                   "above to silence expected multi-category payees "
+                   "(e.g. Amazon).")
     else:
-        for r in silenced_rows:
-            c1, c2, c3 = st.columns([3, 3, 1])
-            c1.markdown(f"**{r['normalized_name']}**")
-            when = str(r['silenced_at'])[:16]
-            c2.caption(f"silenced {when}"
-                       + (f" — {r['note']}" if r['note'] else ""))
-            if c3.button("Un-silence",
-                         key=f"cc_unsilence_{r['normalized_name']}"):
-                queries.unsilence_multicat_payee(conn, r["normalized_name"])
-                st.rerun()
+        with st.expander(f"{n_silenced} silenced payee(s) — click to view / un-silence",
+                          expanded=False):
+            for r in silenced_rows:
+                c1, c2, c3 = st.columns([3, 3, 1])
+                c1.markdown(f"**{r['normalized_name']}**")
+                when = str(r['silenced_at'])[:16]
+                c2.caption(f"silenced {when}"
+                           + (f" — {r['note']}" if r['note'] else ""))
+                if c3.button("Un-silence",
+                             key=f"cc_unsilence_{r['normalized_name']}"):
+                    queries.unsilence_multicat_payee(conn, r["normalized_name"])
+                    st.rerun()
 
 
 def _edit_transactions(conn):
