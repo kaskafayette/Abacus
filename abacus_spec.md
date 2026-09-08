@@ -680,6 +680,16 @@ Items that would be nice to have but aren't currently planned. Re-evaluate when 
 4. **Payor reporting.** A new report (or report section) showing spending by category broken out by payor — i.e. how much David spent vs. how much Debra spent vs. shared expenses. The payor field already exists on every transaction; this is purely a reporting addition. Useful for household-budget conversations and for understanding who's contributing what to which categories.
 5. **AG Grid for Browse/Search.** The Category Assignment and Maintenance screens already use streamlit-aggrid for rich inline editing. The Browse/Search screen still uses the simpler `st.dataframe`, which means you can sort/filter but can't edit fields inline — you have to go to Maintenance → Edit Transactions instead. Upgrading Browse to AG Grid would unify the editing experience. If Streamlit ever becomes a constraint, NiceGUI is the closest alternative with native AG Grid support.
 
+6. **Auto-assign payor from payee metadata.** Pairs with #4 (payor reporting) — the report needs `payor` set on rows to be useful, but setting it by hand on every transaction is tedious. Many vendors are unambiguously one person's (David's optometrist, Debra's hair salon, David's dev tools subscription), and those can auto-fill the payor the same way categories already auto-fill today. Vendors that could be either person (Martha's coffee, Costco, gas stations) stay unclassified and prompt on the row.
+
+    Mechanism, mirroring the existing category auto-fill:
+      - Add a `payor_default` column to `payee_metadata` (values: `David`, `Debra`, `Household`, or `NULL` for "no default, ask each time").
+      - When a transaction is normalized and its payee has a non-null `payor_default`, populate the transaction's `payor` field with that value on save.
+      - When the user sets a payor manually on a row, offer "Remember this — apply `<payor>` to all future `<payee>` transactions" (parallel to today's category-remember flow), which upserts the payee's `payor_default`.
+      - Maintenance → Payee Metadata gains a Payor column (dropdown: David / Debra / Household / — ) so bulk assignments can be done at the vendor level, not one transaction at a time.
+
+    Not urgent because the payor field already exists and can be populated by hand on any single row; this is the ergonomics upgrade for when payor reporting becomes something the user actually reaches for.
+
 ---
 
 ## Explicitly out of scope
