@@ -901,26 +901,127 @@ def _fmt_amt_signed(v: float) -> str:
 
 
 def _edit_transactions(conn):
+    from datetime import timedelta
+    # Reuse the Browse page's helpers so the two filter blocks stay in sync.
+    from ui.browse import _months_ago, AMOUNT_SINGLE_TOL
     st.subheader("Edit Transactions")
 
-    col1, col2, col3 = st.columns(3)
-    search = col1.text_input("Search (payee, description, note)")
-    sources = queries.get_distinct_sources(conn)
-    source_filter = col2.selectbox("Source", [""] + sources)
-    status_filter = col3.selectbox("Status", ["", "pending", "confirmed", "needs_review"])
+    # Same compact-row CSS as Browse — tightens the vertical gap that
+    # Streamlit puts between rows of controls, so more of the grid is
+    # visible without scrolling.
+    st.markdown(
+        "<style>"
+        "div[data-testid='stVerticalBlock']>div[data-testid='element-container']"
+        "{margin-bottom:-0.35rem;}"
+        "</style>",
+        unsafe_allow_html=True,
+    )
 
-    col4, col5 = st.columns(2)
-    start = col4.date_input("From date", value=None, key="txn_start")
-    end = col5.date_input("To date", value=None, key="txn_end")
+    # --- Row 1: two text searches + source + status ---
+    # Same shape as Browse: split into "in Payee" and "Anywhere" so a payee
+    # match doesn't compete with a description hit.
+    col_s1, col_s2, col_src, col_status = st.columns([2, 2, 1.2, 1])
+    with col_s1:
+        search_payee = st.text_input("Search in Payee",
+                                      placeholder="e.g. Safeway",
+                                      key="edittxn_search_payee")
+    with col_s2:
+        search_all = st.text_input("Search Anywhere",
+                                    placeholder="e.g. Medical, Venmo, Chase...",
+                                    key="edittxn_search_all")
+    sources = queries.get_distinct_sources(conn)
+    with col_src:
+        source_filter = st.selectbox("Source", ["All"] + sources,
+                                      key="edittxn_source")
+    with col_status:
+        status_filter = st.selectbox(
+            "Status", ["All", "pending", "confirmed", "needs_review"],
+            key="edittxn_status")
+
+    # --- Row 2: date preset + From/To + Amount From/To ---
+    col_p, col_from, col_to, col_af, col_at = st.columns([1.4, 1, 1, 1, 1])
+
+    with col_p:
+        preset = st.selectbox("Date preset", [
+            "All time", "This month", "Last month", "This quarter",
+            "YTD", "TTM (trailing 12 mo.)", "Last year", "Custom",
+        ], key="edittxn_preset")
+
+    today = date.today()
+    if preset == "All time":
+        start_val = None
+        end_val = None
+    elif preset == "This month":
+        start_val = today.replace(day=1)
+        end_val = today
+    elif preset == "Last month":
+        first_this_month = today.replace(day=1)
+        last_month_end = first_this_month - timedelta(days=1)
+        start_val = last_month_end.replace(day=1)
+        end_val = last_month_end
+    elif preset == "This quarter":
+        q_month = ((today.month - 1) // 3) * 3 + 1
+        start_val = today.replace(month=q_month, day=1)
+        end_val = today
+    elif preset == "YTD":
+        start_val = today.replace(month=1, day=1)
+        end_val = today
+    elif preset == "TTM (trailing 12 mo.)":
+        start_val = _months_ago(today, 12)
+        end_val = today
+    elif preset == "Last year":
+        start_val = today.replace(year=today.year - 1, month=1, day=1)
+        end_val = today.replace(year=today.year - 1, month=12, day=31)
+    else:  # Custom
+        start_val = today.replace(month=1, day=1)
+        end_val = today
+
+    date_disabled = (preset != "Custom" and preset != "All time")
+    with col_from:
+        start = st.date_input("From", value=start_val, key="edittxn_start",
+                               disabled=date_disabled)
+    with col_to:
+        end = st.date_input("To", value=end_val, key="edittxn_end",
+                             disabled=date_disabled)
+
+    with col_af:
+        amt_from = st.number_input("Amount from ($)", value=None,
+                                    min_value=0.0, step=1.0, format="%.2f",
+                                    key="edittxn_amt_from",
+                                    placeholder="e.g. 4600.65")
+    with col_at:
+        amt_to = st.number_input("Amount to ($)", value=None,
+                                  min_value=0.0, step=1.0, format="%.2f",
+                                  key="edittxn_amt_to",
+                                  placeholder="blank for ±$1")
+
+    # Resolve effective amount window (matches Browse's magnitude semantics).
+    if amt_from is not None and amt_to is not None:
+        amount_lo, amount_hi = min(amt_from, amt_to), max(amt_from, amt_to)
+    elif amt_from is not None:
+        amount_lo = amt_from - AMOUNT_SINGLE_TOL
+        amount_hi = amt_from + AMOUNT_SINGLE_TOL
+    elif amt_to is not None:
+        amount_lo = amt_to - AMOUNT_SINGLE_TOL
+        amount_hi = amt_to + AMOUNT_SINGLE_TOL
+    else:
+        amount_lo = amount_hi = None
 
     rows = queries.get_transactions(
         conn,
         start_date=start.isoformat() if start else None,
         end_date=end.isoformat() if end else None,
-        source=source_filter or None,
-        search=search or None,
-        status=status_filter or None,
+        source=source_filter if source_filter != "All" else None,
+        search_payee=search_payee or None,
+        search=search_all or None,
+        status=status_filter if status_filter != "All" else None,
     )
+
+    # Amount filter applied here (same as Browse) to avoid widening
+    # get_transactions' signature.
+    if amount_lo is not None:
+        rows = [r for r in rows
+                if amount_lo <= abs(float(r["amount"])) <= amount_hi]
 
     if not rows:
         st.info("No transactions match the filters.")
