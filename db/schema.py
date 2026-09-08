@@ -105,6 +105,16 @@ CREATE TABLE IF NOT EXISTS item_metadata (
     tax_flags    TEXT
 );
 
+-- Payees the user has explicitly acknowledged as "expected to span multiple
+-- (category, subcategory) combinations" — e.g. Amazon, where each order can
+-- span any category. Silences the Category Consistency Check for that payee
+-- so it stops surfacing on the Maintenance tab.
+CREATE TABLE IF NOT EXISTS payee_multicat_ok (
+    normalized_name TEXT PRIMARY KEY,
+    silenced_at     DATETIME NOT NULL DEFAULT (datetime('now')),
+    note            TEXT
+);
+
 -- Non-cash charitable donations logged manually (goods, vehicles, stock, etc.)
 -- Not part of the bank-transaction stream — it never touches Chase or Fidelity.
 -- Feeds a section of the annual tax-items report at year-end.

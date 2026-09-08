@@ -626,6 +626,92 @@ def delete_item_metadata(conn: sqlite3.Connection, row_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Category-consistency check helpers
+# ---------------------------------------------------------------------------
+
+def get_multicat_payees(conn: sqlite3.Connection) -> dict[str, list[dict]]:
+    """Payees that appear in more than one (category, subcategory) combo across
+    their transactions. Split parents excluded (their legs carry the dollars).
+
+    Returns {payee: [{"category","subcategory","count","total"}...]}, sorted
+    by payee name; per-payee mix sorted by count descending (most common
+    combo first).
+    """
+    rows = conn.execute(
+        f"SELECT payee, "
+        f"       COALESCE(category, '') AS category, "
+        f"       COALESCE(subcategory, '') AS subcategory, "
+        f"       COUNT(*) AS cnt, "
+        f"       COALESCE(SUM(amount), 0) AS total "
+        f"FROM transactions "
+        f"WHERE payee IS NOT NULL AND payee != '' AND {NOT_PARENT_SQL} "
+        f"GROUP BY payee, category, subcategory "
+        f"ORDER BY payee, cnt DESC"
+    ).fetchall()
+    by_payee: dict[str, list[dict]] = {}
+    for r in rows:
+        by_payee.setdefault(r["payee"], []).append({
+            "category":    r["category"],
+            "subcategory": r["subcategory"],
+            "count":       r["cnt"],
+            "total":       float(r["total"] or 0.0),
+        })
+    return {p: mix for p, mix in by_payee.items() if len(mix) > 1}
+
+
+def is_multicat_silenced(conn: sqlite3.Connection, payee: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM payee_multicat_ok WHERE normalized_name = ?", (payee,)
+    ).fetchone() is not None
+
+
+def silence_multicat_payee(conn: sqlite3.Connection, payee: str,
+                            note: str | None = None) -> None:
+    """Mark a payee as intentionally multi-category (e.g. Amazon)."""
+    conn.execute(
+        "INSERT OR REPLACE INTO payee_multicat_ok "
+        "(normalized_name, silenced_at, note) VALUES (?, datetime('now'), ?)",
+        (payee, note),
+    )
+    conn.commit()
+
+
+def unsilence_multicat_payee(conn: sqlite3.Connection, payee: str) -> None:
+    conn.execute(
+        "DELETE FROM payee_multicat_ok WHERE normalized_name = ?", (payee,)
+    )
+    conn.commit()
+
+
+def list_silenced_multicat_payees(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT normalized_name, silenced_at, note "
+        "FROM payee_multicat_ok ORDER BY normalized_name"
+    ).fetchall()
+
+
+def apply_canonical_category_to_payee(conn: sqlite3.Connection, payee: str,
+                                       category: str, subcategory: str | None,
+                                       tax_flags: str | None = None) -> int:
+    """Force every non-split-parent transaction with this payee to the given
+    (category, subcategory[, tax_flags]). Also updates payee_metadata so
+    future ingests default the same way. Returns the number of transactions
+    updated."""
+    n = conn.execute(
+        f"UPDATE transactions SET category=?, subcategory=?, tax_flags=?, overridden=1 "
+        f"WHERE payee=? AND {NOT_PARENT_SQL}",
+        (category, subcategory, tax_flags, payee),
+    ).rowcount
+    upsert_payee_metadata(
+        conn, normalized_name=payee,
+        category_override=category, subcategory_override=subcategory,
+        tax_flags_override=tax_flags, payor=None,
+        note="Category unified via Consistency Check.",
+    )
+    return n
+
+
+# ---------------------------------------------------------------------------
 # Non-cash charitable donations (goods, vehicles, stock, etc.)
 # Logged manually — never touches Chase/Fidelity. Feeds the tax-items report.
 # ---------------------------------------------------------------------------

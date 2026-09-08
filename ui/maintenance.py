@@ -15,8 +15,8 @@ def maintenance_page(conn):
 
     tabs = st.tabs([
         "Source Accounts", "Payee Normalization", "Payee Metadata",
-        "Category Master", "Rename / Merge Payees", "Edit Transactions",
-        "Split Transaction", "Pending Folder", "Database",
+        "Category Master", "Rename / Merge Payees", "Category Consistency",
+        "Edit Transactions", "Split Transaction", "Pending Folder", "Database",
     ])
 
     with tabs[0]:
@@ -30,12 +30,14 @@ def maintenance_page(conn):
     with tabs[4]:
         _rename_merge_payees(conn)
     with tabs[5]:
-        _edit_transactions(conn)
+        _category_consistency(conn)
     with tabs[6]:
-        _split_transaction(conn)
+        _edit_transactions(conn)
     with tabs[7]:
-        _pending_folder(conn)
+        _split_transaction(conn)
     with tabs[8]:
+        _pending_folder(conn)
+    with tabs[9]:
         _database_admin(conn)
 
 
@@ -656,6 +658,134 @@ def _execute_rename(conn, old_name: str, new_name: str):
 # ---------------------------------------------------------------------------
 # Edit Transactions
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Category Consistency Check
+# ---------------------------------------------------------------------------
+
+def _fmt_amt_signed(v: float) -> str:
+    """Local dollar formatter that keeps the sign in front of the $ symbol."""
+    if v > 0:
+        return f"${v:,.2f}"
+    if v < 0:
+        return f"-${abs(v):,.2f}"
+    return "$0.00"
+
+
+def _category_consistency(conn):
+    st.subheader("Category Consistency Check")
+    st.caption(
+        "Finds payees whose transactions are categorized differently across "
+        "the database. For a single-purpose payee (e.g. Supercuts, Emmi "
+        "Petersen) an inconsistency usually needs fixing. For payees that "
+        "legitimately span categories (Amazon), click **Ignore** to silence "
+        "the warning. Silenced payees can be un-silenced at the bottom."
+    )
+
+    conflicts = queries.get_multicat_payees(conn)
+    silenced_rows = queries.list_silenced_multicat_payees(conn)
+    silenced_names = {r["normalized_name"] for r in silenced_rows}
+    active = {p: mix for p, mix in conflicts.items() if p not in silenced_names}
+
+    if not active:
+        st.success(
+            f"✓ No inconsistent-category payees. "
+            f"({len(silenced_names)} payee(s) silenced.)"
+        )
+    else:
+        st.warning(
+            f"**{len(active)}** payee(s) have inconsistent categorization."
+        )
+        for payee, mix in active.items():
+            total_txns = sum(m["count"] for m in mix)
+            total_amt = sum(m["total"] for m in mix)
+            title = (f"**{payee}** — {total_txns} txns across "
+                     f"{len(mix)} categorizations · "
+                     f"{_fmt_amt_signed(total_amt)}")
+            with st.expander(title, expanded=False):
+                # Current mix as a small table
+                df = pd.DataFrame([
+                    {
+                        "Category":    m["category"] or "(uncategorized)",
+                        "Subcategory": m["subcategory"] or "(none)",
+                        "Count":       m["count"],
+                        "Total":       _fmt_amt_signed(m["total"]),
+                    }
+                    for m in mix
+                ])
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+                # Radio: pick one of the current categorizations as canonical.
+                options = [(m["category"], m["subcategory"] or None) for m in mix]
+                labels = [f"{(c or '(uncategorized)')} / {(s or '(none)')}"
+                          f"  ({m['count']} txns)"
+                          for m, (c, s) in zip(mix, options)]
+                # Default to the most-common combo (mix is sorted count DESC)
+                choice_idx = st.radio(
+                    "Pick the canonical categorization (applies to every "
+                    f"{payee!r} transaction):",
+                    range(len(options)),
+                    format_func=lambda i: labels[i],
+                    key=f"cc_choice_{payee}",
+                )
+                target_cat, target_subcat = options[choice_idx]
+
+                col_apply, col_ignore, _ = st.columns([1.4, 1, 3])
+                if col_apply.button(
+                    f"Apply to all {total_txns} txns",
+                    type="primary", key=f"cc_apply_{payee}",
+                ):
+                    # Look up the tax-flag default from the categories master
+                    # for this (cat, subcat) so we set it consistently.
+                    if target_subcat:
+                        r = conn.execute(
+                            "SELECT tax_flag_default FROM categories "
+                            "WHERE category=? AND subcategory=?",
+                            (target_cat, target_subcat)).fetchone()
+                    else:
+                        r = conn.execute(
+                            "SELECT tax_flag_default FROM categories "
+                            "WHERE category=? AND subcategory IS NULL",
+                            (target_cat,)).fetchone()
+                    tax_flag = r["tax_flag_default"] if r else None
+
+                    n = queries.apply_canonical_category_to_payee(
+                        conn, payee, target_cat, target_subcat, tax_flag)
+                    st.success(
+                        f"Updated {n} transaction(s): all {payee!r} → "
+                        f"{target_cat} / {target_subcat or '(none)'}. "
+                        f"payee_metadata updated so future ingests default "
+                        f"the same way."
+                    )
+                    st.rerun()
+
+                if col_ignore.button("Ignore this payee",
+                                     key=f"cc_ignore_{payee}"):
+                    queries.silence_multicat_payee(
+                        conn, payee,
+                        note="Multi-category expected — silenced by user.")
+                    st.success(f"Silenced {payee!r}. It will no longer show "
+                               "up here unless un-silenced.")
+                    st.rerun()
+
+    # --- Silenced-payees management ---
+    st.divider()
+    st.subheader("Currently silenced")
+    if not silenced_rows:
+        st.caption("None. Click **Ignore this payee** above to silence "
+                   "expected multi-category payees like Amazon.")
+    else:
+        for r in silenced_rows:
+            c1, c2, c3 = st.columns([3, 3, 1])
+            c1.markdown(f"**{r['normalized_name']}**")
+            when = str(r['silenced_at'])[:16]
+            c2.caption(f"silenced {when}"
+                       + (f" — {r['note']}" if r['note'] else ""))
+            if c3.button("Un-silence",
+                         key=f"cc_unsilence_{r['normalized_name']}"):
+                queries.unsilence_multicat_payee(conn, r["normalized_name"])
+                st.rerun()
+
 
 def _edit_transactions(conn):
     st.subheader("Edit Transactions")
