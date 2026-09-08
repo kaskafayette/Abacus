@@ -637,6 +637,20 @@ Concrete work that's queued and committed — has a clear path, just hasn't been
 
     Not urgent — the current anti-illusion surfaces work — but the friction will grow every time we add a required field. Revisit with fresh eyes.
 
+16. **Subdivide the Health and Wellness category.** Health and Wellness is currently one of the largest categories in the ledger, which makes reports on it a wall of undifferentiated line items — no way to tell at a glance how much went to hair vs. massage vs. gym. Break it into the following subcategories:
+
+    - **Hair** — cuts, color, styling.
+    - **Nails** — manicures, pedicures.
+    - **Massage** — therapeutic and spa.
+    - **Fitness** — gym membership, classes, personal training, fitness apps.
+    - **Product** — physical items (supplements, skincare, over-the-counter health goods). Name may want refining at implementation time — "Products" or "Supplies" if that reads better once the label is in context.
+
+    Implementation touches:
+      - Add the five subcategories to the `categories` master table (Maintenance → Categories tab, or a small migration).
+      - Backfill existing `Health and Wellness` rows: most will have `subcategory=NULL` today. After adding the subs, the Diagnostics page will start surfacing every historical Health and Wellness row as "missing subcategory" (because `category_requires_subcategory` will now be True) — expect a batch to work through on Maintenance → Edit Transactions.
+      - Existing rows with `subcategory='Misc. Medical'` or other pre-existing subs are unaffected — they keep what they have, and the Diagnostics page only flags the ones without a sub.
+      - Consider a Categorize-tab convenience: when the user picks `Health and Wellness`, the subcategory dropdown pre-cascades to the new five (plus any prior ones). The cascading-subcategory work in Next Steps #13 covers the general mechanism.
+
 ---
 
 ## Future Enhancements (longer-horizon, no firm commitment)
