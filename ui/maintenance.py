@@ -16,10 +16,14 @@ def maintenance_page(conn):
 
     # Category Consistency used to be its own tab; it's now folded into
     # Payee Metadata since both are about a payee's canonical categorization.
+    # Pending Folder used to be a tab too; removed once Venmo became a
+    # first-class checking source — no enrichment sources currently use the
+    # pending/ pipeline, so the tab would sit empty forever. Re-add here when
+    # Amazon enrichment (Next Steps #1-3) or another enricher lands.
     tabs = st.tabs([
         "Source Accounts", "Payee Normalization", "Payee Metadata",
         "Category Master", "Rename / Merge Payees",
-        "Edit Transactions", "Split Transaction", "Pending Folder", "Database",
+        "Edit Transactions", "Split Transaction", "Database",
     ])
 
     with tabs[0]:
@@ -37,8 +41,6 @@ def maintenance_page(conn):
     with tabs[6]:
         _split_transaction(conn)
     with tabs[7]:
-        _pending_folder(conn)
-    with tabs[8]:
         _database_admin(conn)
 
 
@@ -1474,51 +1476,6 @@ def _split_transaction(conn):
 
     st.divider()
     _render_split_editor(conn, parent_id, key_prefix="splittab")
-
-
-# ---------------------------------------------------------------------------
-# Pending Folder
-# ---------------------------------------------------------------------------
-
-def _pending_folder(conn):
-    st.subheader("Pending Folder")
-    st.caption(
-        "Enrichment files (Venmo, Amazon, ...) sit here until every record "
-        "they contain has matched a Chase row. Files automatically retry on "
-        "each Ingest run. Use the cleanup tool below to archive stale files "
-        "manually — nothing moves automatically."
-    )
-
-    from processing.enrich import list_pending_status, cleanup_pending
-
-    statuses = list_pending_status(conn)
-    if not statuses:
-        st.info("Pending folder is empty.")
-        return
-
-    df = pd.DataFrame(statuses)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-    st.divider()
-    st.markdown("**Cleanup:** move pending files older than the threshold "
-                "into `processed/` (they'll no longer be retried).")
-    col1, col2 = st.columns([1, 3])
-    threshold_days = col1.number_input(
-        "Older than (days)",
-        min_value=30, max_value=3650, value=180, step=30,
-        key="pending_cleanup_days",
-    )
-    col2.caption(f"Default 180 days. Today: {date.today().isoformat()}.")
-
-    if st.button("Move stale files to processed/", key="pending_cleanup"):
-        moved = cleanup_pending(conn, int(threshold_days))
-        if moved:
-            st.success(f"Moved {len(moved)} file(s) to processed/:")
-            for fname in moved:
-                st.write(f"  - `{fname}`")
-        else:
-            st.info(f"No files older than {threshold_days} days.")
-        st.rerun()
 
 
 # ---------------------------------------------------------------------------
