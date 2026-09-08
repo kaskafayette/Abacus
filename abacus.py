@@ -16,6 +16,20 @@ def main():
 
     conn = st.session_state.conn
 
+    # Query-param nav: the anti-illusion warning callouts (sidebar and home
+    # page) embed their "Show me these" / "Show me the list" call-to-action
+    # as an <a href="?nav=Diagnostics"> anchor INSIDE the colored oval,
+    # because Streamlit's st.warning() doesn't allow a Streamlit button
+    # in the same visual box. Clicking the anchor updates the URL, this
+    # handler catches it, sets nav_page, wipes the qp so a refresh won't
+    # keep re-routing, and reruns so the sidebar radio picks up the new
+    # page. Must run BEFORE the sidebar radio is instantiated.
+    _nav_qp = st.query_params.get("nav")
+    if _nav_qp:
+        st.session_state["nav_page"] = _nav_qp
+        del st.query_params["nav"]
+        st.rerun()
+
     # Pre-route flush: if the user was editing a Note in the Interactive
     # Category Summary and clicked a sidebar radio to leave, the cell blurs
     # (thanks to stopEditingWhenCellsLoseFocus) which commits it and fires a
@@ -42,12 +56,38 @@ def main():
             parts.append(f"{unc_count} unresolved (${float(unc_abs):,.0f})")
         if ms_count:
             parts.append(f"{ms_count} missing-subcat (${float(ms_abs):,.0f})")
-        st.sidebar.warning("⚠ " + " · ".join(parts))
-        # Click-through to the Diagnostics page which lists every offender
-        # with an 'Issue' column explaining what's wrong.
-        if st.sidebar.button("Show me these →", key="sidebar_show_unresolved"):
-            st.session_state["nav_page"] = "Diagnostics"
-            st.rerun()
+        # Custom callout so the "Show me these" call-to-action lives INSIDE
+        # the yellow oval, not as a separate button below it. Clicking the
+        # anchor routes through the query-param handler at the top of main().
+        st.sidebar.markdown(
+            f"""
+<div style="
+    background-color: rgba(255, 227, 18, 0.14);
+    border-left: 4px solid #ffd400;
+    padding: 0.6rem 0.75rem;
+    border-radius: 0.35rem;
+    font-size: 0.88rem;
+    line-height: 1.35;
+    color: inherit;
+    margin-bottom: 0.5rem;
+">
+⚠ {' · '.join(parts)}
+<div style="margin-top: 0.55rem;">
+<a href="?nav=Diagnostics" target="_self" style="
+    background-color: #ffd400;
+    color: #262730;
+    padding: 0.3rem 0.65rem;
+    border-radius: 0.3rem;
+    text-decoration: none;
+    font-weight: 600;
+    font-size: 0.82rem;
+    display: inline-block;
+">Show me these →</a>
+</div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
     else:
         st.sidebar.success("✓ 0 unresolved · 0 missing-subcat")
     # Kept for backward-compat callers that still reference pending_count.
@@ -104,25 +144,56 @@ def _home_page(conn, pending_count):
     unc_count, unc_abs = queries.get_unconfirmed_count(conn)
     ms_count, ms_abs = queries.get_missing_subcategory_count(conn)
     if unc_count > 0 or ms_count > 0:
-        parts = []
+        # HTML rather than markdown so we can embed the CTA anchor INSIDE the
+        # same colored callout (Streamlit's st.warning() doesn't allow a
+        # Streamlit button in the same visual box). The anchor routes through
+        # the query-param handler at the top of main().
+        li_parts = []
         if unc_count > 0:
-            parts.append(
-                f"- **{unc_count}** transactions unresolved (pending or "
-                f"needs_review), ${float(unc_abs):,.2f} absolute value — "
-                f"work through them on **Normalize & Categorize**."
+            li_parts.append(
+                f"<li><strong>{unc_count}</strong> transactions unresolved "
+                f"(pending or needs_review), ${float(unc_abs):,.2f} absolute "
+                f"value — work through them on <strong>Normalize &amp; "
+                f"Categorize</strong>.</li>"
             )
         if ms_count > 0:
-            parts.append(
-                f"- **{ms_count}** transactions have a category but no "
-                f"subcategory where one is required, ${float(ms_abs):,.2f} "
-                f"absolute value — fix them on **Maintenance → Edit "
-                f"Transactions** (they look done but aren't fully classified)."
+            li_parts.append(
+                f"<li><strong>{ms_count}</strong> transactions have a "
+                f"category but no subcategory where one is required, "
+                f"${float(ms_abs):,.2f} absolute value — fix them on "
+                f"<strong>Maintenance → Edit Transactions</strong> (they "
+                f"look done but aren't fully classified).</li>"
             )
-        st.warning("**⚠ Ledger is not clean:**\n\n" + "\n".join(parts))
-        if st.button("Show me the list with explanations →",
-                     type="primary", key="home_show_unresolved"):
-            st.session_state["nav_page"] = "Diagnostics"
-            st.rerun()
+        st.markdown(
+            f"""
+<div style="
+    background-color: rgba(255, 227, 18, 0.14);
+    border-left: 4px solid #ffd400;
+    padding: 1rem 1.1rem 1.1rem 1.1rem;
+    border-radius: 0.5rem;
+    margin-bottom: 1rem;
+    color: inherit;
+">
+<div style="font-weight: 700; font-size: 1.02rem; margin-bottom: 0.4rem;">
+⚠ Ledger is not clean:
+</div>
+<ul style="margin-top: 0.35rem; margin-bottom: 0.85rem; padding-left: 1.5rem;">
+{''.join(li_parts)}
+</ul>
+<a href="?nav=Diagnostics" target="_self" style="
+    background-color: #ff4b4b;
+    color: white;
+    padding: 0.55rem 1.1rem;
+    border-radius: 0.5rem;
+    text-decoration: none;
+    font-weight: 600;
+    font-size: 0.95rem;
+    display: inline-block;
+">▶ Show me the list with explanations</a>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
     else:
         st.success(
             "✓ Ledger is clean — every transaction is confirmed AND fully "
