@@ -760,11 +760,14 @@ def apply_canonical_category_to_payee(conn: sqlite3.Connection, payee: str,
                                        category: str, subcategory: str | None,
                                        tax_flags: str | None = None) -> int:
     """Force every non-split-parent transaction with this payee to the given
-    (category, subcategory[, tax_flags]). Also updates payee_metadata so
-    future ingests default the same way. Returns the number of transactions
-    updated."""
+    (category, subcategory[, tax_flags]). Also flips status to 'confirmed'
+    so the newly-unified categorization shows up in the default Confirmed-only
+    report scope (otherwise a pending/needs_review row would hide the fix).
+    Updates payee_metadata too so future ingests default the same way.
+    Returns the number of transactions updated."""
     n = conn.execute(
-        f"UPDATE transactions SET category=?, subcategory=?, tax_flags=?, overridden=1 "
+        f"UPDATE transactions SET category=?, subcategory=?, tax_flags=?, "
+        f"overridden=1, status='confirmed' "
         f"WHERE payee=? AND {NOT_PARENT_SQL}",
         (category, subcategory, tax_flags, payee),
     ).rowcount
