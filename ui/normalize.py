@@ -384,9 +384,17 @@ def _normalization(conn):
                 "is_check": item.get("is_check", False),
                 "check_number": item.get("check_number"),
                 "date": item.get("date"),
+                "date_min": item.get("date"),
+                "date_max": item.get("date"),
                 "amount": item.get("amount"),
                 "source": item.get("source"),
             }
+        else:
+            d = item.get("date")
+            if d and (desc_groups[desc]["date_min"] is None or d < desc_groups[desc]["date_min"]):
+                desc_groups[desc]["date_min"] = d
+            if d and (desc_groups[desc]["date_max"] is None or d > desc_groups[desc]["date_max"]):
+                desc_groups[desc]["date_max"] = d
         desc_groups[desc]["count"] += 1
         desc_groups[desc]["total"] += float(item["amount"])
         desc_groups[desc]["ids"].append(item["id"])
@@ -420,17 +428,26 @@ def _normalization(conn):
     )
 
     # Header row
-    col_h1, col_h2, col_h3, col_h4 = st.columns([3, 0.7, 0.8, 3.5])
+    col_h1, col_hd, col_h2, col_h3, col_h4 = st.columns([2.8, 1.4, 0.7, 0.8, 3.3])
     col_h1.markdown("**Description**")
+    col_hd.markdown("**Date**")
     col_h2.markdown("**Count**")
     col_h3.markdown("**Total**")
     col_h4.markdown("**Payee Name**")
 
     for idx, item in enumerate(display_items):
-        col_desc, col_count, col_total, col_name = st.columns([3, 0.7, 0.8, 3.5])
+        col_desc, col_date, col_count, col_total, col_name = st.columns([2.8, 1.4, 0.7, 0.8, 3.3])
 
         total = item["total"]
         col_desc.text(item["cleaned_desc"])
+        # Date: single date when the group has just one txn or all share a date;
+        # otherwise show "min...max" so it's obvious this is a recurring pattern.
+        dmin = item.get("date_min") or item.get("date")
+        dmax = item.get("date_max") or item.get("date")
+        if dmin and dmax and dmin != dmax:
+            col_date.text(f"{dmin} ... {dmax}")
+        else:
+            col_date.text(dmin or "")
         col_count.text(str(item["count"]))
         # Render credits (positive = money in) in green; debits stay default.
         if total > 0:
