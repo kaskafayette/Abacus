@@ -126,20 +126,36 @@ def _source_accounts(conn):
 def _payee_normalization(conn):
     st.subheader("Payee Normalization Rules")
 
+    st.caption(
+        "**whole_word_only**: when ✓, the pattern only matches when it appears "
+        "as a whole word (regex `\\b` boundaries). Use it for short patterns "
+        "like `NEST` or `GAP` that would otherwise over-match inside "
+        "`NESTLDOWN`, `GAPPY`, etc. Default off = substring match."
+    )
     rows = queries.get_payee_normalizations(conn)
     if rows:
         df = pd.DataFrame([dict(r) for r in rows])
+        # Some rows on partially-migrated DBs may not have whole_word_only —
+        # backfill for display so the grid shows the column.
+        if "whole_word_only" not in df.columns:
+            df["whole_word_only"] = 0
+        df["whole_word_only"] = df["whole_word_only"].fillna(0).astype(int).astype(bool)
 
-        gb = GridOptionsBuilder.from_dataframe(df[["id", "search_pattern", "normalized_name", "payee_suffix"]])
+        cols_shown = ["id", "search_pattern", "normalized_name", "payee_suffix", "whole_word_only"]
+
+        gb = GridOptionsBuilder.from_dataframe(df[cols_shown])
         gb.configure_default_column(resizable=True, sortable=True, editable=False)
         gb.configure_grid_options(singleClickEdit=True, stopEditingWhenCellsLoseFocus=True)
         gb.configure_column("id", width=50)
         gb.configure_column("search_pattern", editable=True, width=200)
         gb.configure_column("normalized_name", editable=True, width=200)
         gb.configure_column("payee_suffix", editable=True, width=150)
+        gb.configure_column("whole_word_only", editable=True, width=140,
+                            cellEditor="agCheckboxCellEditor",
+                            cellRenderer="agCheckboxCellRenderer")
 
         grid_response = AgGrid(
-            df[["id", "search_pattern", "normalized_name", "payee_suffix"]],
+            df[cols_shown],
             gridOptions=gb.build(),
             update_mode=GridUpdateMode.VALUE_CHANGED,
             fit_columns_on_grid_load=True,
@@ -154,6 +170,7 @@ def _payee_normalization(conn):
                     conn, int(row["id"]),
                     row["search_pattern"], row["normalized_name"],
                     row["payee_suffix"] if pd.notna(row["payee_suffix"]) and row["payee_suffix"] else None,
+                    whole_word_only=bool(row["whole_word_only"]),
                 )
             st.success("Saved.")
             st.rerun()
@@ -174,11 +191,16 @@ def _payee_normalization(conn):
             pattern = st.text_input("Search Pattern")
             name = st.text_input("Normalized Name")
             suffix = st.text_input("Payee Suffix (optional)")
+            wwo = st.checkbox(
+                "Whole word only (safer for short patterns like `NEST`, `GAP`)",
+                value=False, key="add_norm_wwo",
+            )
             col1, col2 = st.columns(2)
             save = col1.form_submit_button("Add")
             cancel = col2.form_submit_button("Cancel")
         if save and pattern and name:
-            queries.insert_payee_normalization(conn, pattern, name, suffix or None)
+            queries.insert_payee_normalization(
+                conn, pattern, name, suffix or None, whole_word_only=wwo)
             st.success("Added.")
             st.rerun()
         if cancel:

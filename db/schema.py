@@ -29,10 +29,15 @@ CREATE TABLE IF NOT EXISTS transactions (
 );
 
 CREATE TABLE IF NOT EXISTS payee_normalization (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    search_pattern  TEXT NOT NULL,
-    normalized_name TEXT NOT NULL,
-    payee_suffix    TEXT
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    search_pattern    TEXT NOT NULL,
+    normalized_name   TEXT NOT NULL,
+    payee_suffix      TEXT,
+    -- When 1, match only when the pattern occurs as a whole word (regex \b
+    -- boundaries). Prevents short rules like 'NEST' from over-matching
+    -- substrings inside 'NESTLDOWN', 'STONEST', etc. Defaults to 0 for
+    -- backward compat with substring rules.
+    whole_word_only   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS payee_metadata (
@@ -243,6 +248,7 @@ def init_db(db_path: Path | None = None) -> tuple[sqlite3.Connection, bool]:
     _migrate_venmo_to_via_only(conn)
     _migrate_add_split_parent_id(conn)
     _migrate_venmo_source_to_checking(conn)
+    _migrate_add_whole_word_only(conn)
 
     if is_new:
         conn.executemany(
@@ -312,6 +318,23 @@ def _migrate_source_file_map(conn: sqlite3.Connection) -> None:
     if not has_replaced:
         conn.execute("ALTER TABLE source_file_map ADD COLUMN replaced_by_prefix TEXT")
     conn.commit()
+
+
+def _migrate_add_whole_word_only(conn: sqlite3.Connection) -> None:
+    """Add the whole_word_only column to payee_normalization if missing.
+
+    Existing rules default to 0 (backward-compatible substring matching).
+    New rules the user creates via the UI can opt into word-boundary
+    matching to avoid over-matching short patterns (e.g. 'NEST' inside
+    'NESTLDOWN' or 'STONEST').
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(payee_normalization)")}
+    if "whole_word_only" not in cols:
+        conn.execute(
+            "ALTER TABLE payee_normalization "
+            "ADD COLUMN whole_word_only INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
 
 
 def _migrate_venmo_source_to_checking(conn: sqlite3.Connection) -> None:

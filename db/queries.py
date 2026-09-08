@@ -183,33 +183,63 @@ def get_payee_normalizations(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+import re as _re
+
+
 def find_payee_match(conn: sqlite3.Connection, raw_description: str) -> sqlite3.Row | None:
-    """Find the first matching normalization rule for a raw description (case-insensitive)."""
+    """Find the first matching normalization rule for a raw description
+    (case-insensitive). Substring match by default; whole-word (regex \\b
+    boundary) match when the rule's whole_word_only flag is set.
+    """
     rows = conn.execute("SELECT * FROM payee_normalization").fetchall()
     raw_lower = raw_description.lower()
     for row in rows:
-        if row["search_pattern"].lower() in raw_lower:
-            return row
+        pat = row["search_pattern"].lower()
+        # whole_word_only column may not exist on partially-migrated DBs;
+        # treat missing key as False.
+        try:
+            wwo = bool(row["whole_word_only"])
+        except (IndexError, KeyError):
+            wwo = False
+        if wwo:
+            if _re.search(r"\b" + _re.escape(pat) + r"\b", raw_lower):
+                return row
+        else:
+            if pat in raw_lower:
+                return row
     return None
 
 
 def insert_payee_normalization(conn: sqlite3.Connection, search_pattern: str,
-                                normalized_name: str, payee_suffix: str | None = None) -> None:
+                                normalized_name: str, payee_suffix: str | None = None,
+                                whole_word_only: bool = False) -> None:
     conn.execute(
-        "INSERT INTO payee_normalization (search_pattern, normalized_name, payee_suffix) "
-        "VALUES (?, ?, ?)",
-        (search_pattern, normalized_name, payee_suffix),
+        "INSERT INTO payee_normalization "
+        "(search_pattern, normalized_name, payee_suffix, whole_word_only) "
+        "VALUES (?, ?, ?, ?)",
+        (search_pattern, normalized_name, payee_suffix, 1 if whole_word_only else 0),
     )
     conn.commit()
 
 
 def update_payee_normalization(conn: sqlite3.Connection, row_id: int, search_pattern: str,
-                                normalized_name: str, payee_suffix: str | None = None) -> None:
-    conn.execute(
-        "UPDATE payee_normalization SET search_pattern = ?, normalized_name = ?, payee_suffix = ? "
-        "WHERE id = ?",
-        (search_pattern, normalized_name, payee_suffix, row_id),
-    )
+                                normalized_name: str, payee_suffix: str | None = None,
+                                whole_word_only: bool | None = None) -> None:
+    """Update a normalization rule. If whole_word_only is None, the existing
+    value is preserved (for callers that don't yet know about the flag)."""
+    if whole_word_only is None:
+        conn.execute(
+            "UPDATE payee_normalization SET search_pattern = ?, normalized_name = ?, "
+            "payee_suffix = ? WHERE id = ?",
+            (search_pattern, normalized_name, payee_suffix, row_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE payee_normalization SET search_pattern = ?, normalized_name = ?, "
+            "payee_suffix = ?, whole_word_only = ? WHERE id = ?",
+            (search_pattern, normalized_name, payee_suffix,
+             1 if whole_word_only else 0, row_id),
+        )
     conn.commit()
 
 

@@ -532,7 +532,13 @@ def _normalization(conn):
 
             via = item["via"] or None
             pattern = item["cleaned_desc"]
-            queries.insert_payee_normalization(conn, pattern, name)
+            # For short patterns (<=5 chars) default to whole-word matching —
+            # substrings like 'NEST' would otherwise over-match 'NESTLDOWN' or
+            # 'STONEST'. The user can toggle this off on the Payee
+            # Normalization Maintenance tab if a substring rule is intended.
+            wwo = len(pattern.strip()) <= 5
+            queries.insert_payee_normalization(
+                conn, pattern, name, whole_word_only=wwo)
             for tid in item["ids"]:
                 updates = {"payee": name}
                 if via:
