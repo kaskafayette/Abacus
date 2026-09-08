@@ -1002,18 +1002,39 @@ def _write_top_banners(pdf: AbacusPDF, conn: sqlite3.Connection,
     pdf.cell(0, 6, f"Scope: {MODE_LABELS[mode]}",
              new_x="LMARGIN", new_y="NEXT")
 
-    # Mode-specific inclusion/exclusion line
+    # In-scope line (what this specific report's date-range/mode covers)
     pdf.set_font("Helvetica", "", 9)
     if mode == MODE_FINALIZED:
-        banner = (f"This report EXCLUDES {nf_count} transaction(s) totaling "
+        banner = (f"In this report's period ({start} to {end}): "
+                  f"EXCLUDES {nf_count} transaction(s) totaling "
                   f"{_fmt_amt(nf_total)} that are not yet confirmed.")
     elif mode == MODE_DRAFT:
-        banner = (f"This report INCLUDES ONLY draft transactions: {nf_count} "
+        banner = (f"In this report's period ({start} to {end}): "
+                  f"INCLUDES ONLY draft transactions: {nf_count} "
                   f"totaling {_fmt_amt(nf_total)} (not yet confirmed).")
     else:  # MODE_ALL
-        banner = (f"This report INCLUDES {nf_count} transaction(s) totaling "
+        banner = (f"In this report's period ({start} to {end}): "
+                  f"INCLUDES {nf_count} transaction(s) totaling "
                   f"{_fmt_amt(nf_total)} that are not yet confirmed.")
     pdf.cell(0, 5, _safe(banner), new_x="LMARGIN", new_y="NEXT")
+
+    # GLOBAL line — always printed. This is the anti-illusion guard: even
+    # when the report's period is fully clean (in-scope count == 0), we
+    # still surface any unresolved items sitting in OTHER months so the
+    # reader is never fooled into thinking the whole ledger is finished.
+    global_cnt, global_abs = queries.get_unconfirmed_count(conn)
+    if global_cnt == 0:
+        pdf.set_font("Helvetica", "I", 9)
+        line = "Across the entire database: 0 unresolved transactions (nothing pending/needs_review)."
+        pdf.set_text_color(0, 130, 0)  # green
+    else:
+        pdf.set_font("Helvetica", "B", 9)
+        line = (f"Across the ENTIRE database: {global_cnt} unresolved "
+                f"transaction(s) totaling ${float(global_abs):,.2f} (absolute value) "
+                f"still to review — regardless of this report's date range.")
+        pdf.set_text_color(180, 0, 0)  # red
+    pdf.cell(0, 5, _safe(line), new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
 
     # Missing-payee warning (only if any in-scope rows have NULL payee)
     if mp_count:

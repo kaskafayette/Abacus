@@ -314,6 +314,25 @@ def get_pending_count(conn: sqlite3.Connection) -> int:
     return row["cnt"]
 
 
+def get_unconfirmed_count(conn: sqlite3.Connection) -> tuple[int, Decimal]:
+    """Global count + absolute-value sum of every non-confirmed transaction
+    across the entire database (pending or needs_review). Split parents are
+    excluded (their legs carry the dollars).
+
+    Used to surface "there are unresolved items *somewhere*" in the sidebar,
+    the Home page, and the top banner of every generated report — so a
+    date-scoped 'in-scope 0 unconfirmed' can never create the illusion that
+    the whole ledger is clean when unresolved items sit in other months.
+    Absolute value chosen so negatives and positives can't cancel and hide.
+    """
+    row = conn.execute(
+        f"SELECT COUNT(*) AS cnt, COALESCE(SUM(ABS(amount)), 0) AS total "
+        f"FROM transactions "
+        f"WHERE status IN ('pending', 'needs_review') AND {NOT_PARENT_SQL}"
+    ).fetchone()
+    return int(row["cnt"]), Decimal(str(row["total"] or 0))
+
+
 def get_transactions(conn: sqlite3.Connection, start_date: str | None = None,
                      end_date: str | None = None, source: str | None = None,
                      search: str | None = None, search_payee: str | None = None,

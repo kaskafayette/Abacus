@@ -20,9 +20,19 @@ def main():
     st.sidebar.title("Abacus")
     st.sidebar.caption(f"Database: {DB_PATH.name}")
 
+    # Global unresolved count (pending + needs_review, split parents excluded).
+    # Shown persistently in the sidebar so a scoped "0 unconfirmed" in one
+    # report can never create the illusion the whole ledger is clean.
+    unc_count, unc_abs = queries.get_unconfirmed_count(conn)
+    if unc_count > 0:
+        st.sidebar.warning(
+            f"⚠ **{unc_count}** transaction(s) unresolved "
+            f"(${float(unc_abs):,.0f} abs) — pending or needs_review"
+        )
+    else:
+        st.sidebar.success("✓ 0 unresolved transactions")
+    # Kept for backward-compat callers that still reference pending_count.
     pending_count = queries.get_pending_count(conn)
-    if pending_count > 0:
-        st.sidebar.warning(f"⚠ {pending_count} transactions pending review")
 
     page = st.sidebar.radio(
         "Navigate",
@@ -64,10 +74,19 @@ def _home_page(conn, pending_count):
     else:
         st.success(f"Using existing database: {DB_PATH.name}")
 
-    if pending_count > 0:
+    # Anti-illusion prominent warning: any unresolved (pending or needs_review)
+    # rows, regardless of month, so the reader knows the ledger isn't finished.
+    unc_count, unc_abs = queries.get_unconfirmed_count(conn)
+    if unc_count > 0:
         st.warning(
-            f"You have **{pending_count}** transactions awaiting review. "
-            "Go to **Normalize & Categorize** in the sidebar to continue."
+            f"**⚠ {unc_count}** transactions across the entire database are "
+            f"NOT yet confirmed (status = pending or needs_review), totaling "
+            f"**${float(unc_abs):,.2f}** in absolute value. Go to "
+            f"**Normalize & Categorize** to work through them."
+        )
+    else:
+        st.success(
+            "✓ All transactions are confirmed. Nothing pending or needing review."
         )
 
     # Database stats

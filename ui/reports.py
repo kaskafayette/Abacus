@@ -318,8 +318,21 @@ def _interactive_category_summary(conn):
         "Click the triangle beside any row to drill down: "
         "**Category → Subcategory → Payee → Transactions**. "
         "Amounts aggregate up at each level; credits render in green. "
-        "Read-only — no risk of accidentally editing a transaction."
+        "Notes are editable here (see Save Note changes below the grid); "
+        "no other field is editable."
     )
+
+    # Anti-illusion global banner — always visible regardless of the date
+    # range chosen for this report.
+    unc_count, unc_abs = queries.get_unconfirmed_count(conn)
+    if unc_count > 0:
+        st.warning(
+            f"⚠ **{unc_count}** transaction(s) across the entire database are "
+            f"unresolved (pending or needs_review), totaling "
+            f"**${float(unc_abs):,.2f}** in absolute value. The default "
+            f"'Confirmed only' scope below **hides** them — switch scope to "
+            f"**All transactions** or **Draft only** to see them."
+        )
 
     default_start, default_end = _get_date_range(conn)
     col1, col2 = st.columns(2)
