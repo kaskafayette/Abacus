@@ -342,6 +342,10 @@ def _interactive_category_summary(conn):
                 f"abs. They appear here under `(none)` sub-groups."
             )
         st.warning("**⚠ Database-wide data-quality warnings:**\n\n" + "\n".join(parts))
+        if st.button("Show me the list with explanations →",
+                     key="ics_show_unresolved"):
+            st.session_state["nav_page"] = "Diagnostics"
+            st.rerun()
 
     default_start, default_end = _get_date_range(conn)
     col1, col2 = st.columns(2)

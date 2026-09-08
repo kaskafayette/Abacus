@@ -33,6 +33,11 @@ def main():
         if ms_count:
             parts.append(f"{ms_count} missing-subcat (${float(ms_abs):,.0f})")
         st.sidebar.warning("⚠ " + " · ".join(parts))
+        # Click-through to the Diagnostics page which lists every offender
+        # with an 'Issue' column explaining what's wrong.
+        if st.sidebar.button("Show me these →", key="sidebar_show_unresolved"):
+            st.session_state["nav_page"] = "Diagnostics"
+            st.rerun()
     else:
         st.sidebar.success("✓ 0 unresolved · 0 missing-subcat")
     # Kept for backward-compat callers that still reference pending_count.
@@ -40,13 +45,18 @@ def main():
 
     page = st.sidebar.radio(
         "Navigate",
-        ["Home", "Browse / Search", "Ingest", "Normalize & Categorize",
-         "Non-cash Donations", "Reports", "Maintenance"],
+        ["Home", "Diagnostics", "Browse / Search", "Ingest",
+         "Normalize & Categorize", "Non-cash Donations", "Reports",
+         "Maintenance"],
+        key="nav_page",       # keyed so anti-illusion banners can jump here
         label_visibility="collapsed",
     )
 
     if page == "Home":
         _home_page(conn, pending_count)
+    elif page == "Diagnostics":
+        from ui.diagnostics import diagnostics_page
+        diagnostics_page(conn)
     elif page == "Browse / Search":
         from ui.browse import browse_page
         browse_page(conn)
@@ -99,6 +109,10 @@ def _home_page(conn, pending_count):
                 f"Transactions** (they look done but aren't fully classified)."
             )
         st.warning("**⚠ Ledger is not clean:**\n\n" + "\n".join(parts))
+        if st.button("Show me the list with explanations →",
+                     type="primary", key="home_show_unresolved"):
+            st.session_state["nav_page"] = "Diagnostics"
+            st.rerun()
     else:
         st.success(
             "✓ Ledger is clean — every transaction is confirmed AND fully "
