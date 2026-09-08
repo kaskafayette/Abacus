@@ -452,13 +452,16 @@ def _interactive_category_summary(conn):
 
     # AG Grid with row grouping — one tree column, expandable at each level.
     from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
-    from ui._amount_style import amount_cell_style, amount_value_formatter
+    from ui._amount_style import (
+        amount_cell_style, amount_value_formatter, case_insensitive_comparator,
+    )
 
     gb = GridOptionsBuilder.from_dataframe(df)
     # Default: read-only. Only the Note column overrides to editable=True below.
     gb.configure_default_column(
         resizable=True, sortable=True, editable=False, filter=True,
         suppressMenu=False,
+        comparator=case_insensitive_comparator(),
     )
     # id: hidden — needed to save note edits back to the correct transaction.
     gb.configure_column("id", hide=True)

@@ -776,8 +776,10 @@ def _categorization(conn):
         }}
     """)
 
+    from ui._amount_style import case_insensitive_comparator
     gb = GridOptionsBuilder.from_dataframe(df)
-    gb.configure_default_column(resizable=True, sortable=True, editable=False)
+    gb.configure_default_column(resizable=True, sortable=True, editable=False,
+                                comparator=case_insensitive_comparator())
     gb.configure_grid_options(singleClickEdit=True, stopEditingWhenCellsLoseFocus=True)
 
     # Read-only columns

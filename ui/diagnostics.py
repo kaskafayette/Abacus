@@ -11,7 +11,9 @@ import streamlit as st
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 
 from db import queries
-from ui._amount_style import amount_cell_style, amount_value_formatter
+from ui._amount_style import (
+    amount_cell_style, amount_value_formatter, case_insensitive_comparator,
+)
 
 
 def _issues_for_row(conn, r) -> list[str]:
@@ -105,7 +107,8 @@ def diagnostics_page(conn):
     df = pd.DataFrame(data)
 
     gb = GridOptionsBuilder.from_dataframe(df)
-    gb.configure_default_column(resizable=True, sortable=True, editable=False, filter=True)
+    gb.configure_default_column(resizable=True, sortable=True, editable=False, filter=True,
+                                comparator=case_insensitive_comparator())
     gb.configure_column("id", width=70)
     gb.configure_column("Date", width=105)
     gb.configure_column("Amount", width=115, type=["numericColumn"],

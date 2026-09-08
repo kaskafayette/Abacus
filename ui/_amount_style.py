@@ -51,6 +51,30 @@ def format_signed_amount(v) -> str:
     return f"${v:,.2f}"
 
 
+def case_insensitive_comparator() -> JsCode:
+    """AG Grid column comparator that sorts strings case-blind.
+
+    Default AG Grid sort is case-sensitive so ALL CAPS payees sort before
+    lowercase — e.g. "AMERICAN" comes before "abstract". Applied on every
+    grid via configure_default_column(..., comparator=<this>).
+
+    Non-string values fall back to their natural JS ordering, so numeric
+    and date columns (which come in as ISO strings anyway) still sort
+    correctly.
+    """
+    return JsCode("""
+        function(a, b) {
+            if (a == null && b == null) return 0;
+            if (a == null) return -1;
+            if (b == null) return 1;
+            if (typeof a === 'string' && typeof b === 'string') {
+                return a.toLowerCase().localeCompare(b.toLowerCase());
+            }
+            return a < b ? -1 : a > b ? 1 : 0;
+        }
+    """)
+
+
 def styler_for_amount_column(df, column: str = "Amount"):
     """Return a Pandas Styler that formats `column` as signed currency and
     colors positive values green. Apply to st.dataframe via:

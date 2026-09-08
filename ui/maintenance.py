@@ -8,6 +8,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 
 from db import queries
 from db.schema import DB_PATH
+from ui._amount_style import case_insensitive_comparator
 
 
 def maintenance_page(conn):
@@ -76,7 +77,8 @@ def _source_accounts(conn):
     type_choices = sorted({"checking", "credit_card"} | enricher_account_types())
 
     gb = GridOptionsBuilder.from_dataframe(df[display_cols])
-    gb.configure_default_column(resizable=True, sortable=True, editable=False)
+    gb.configure_default_column(resizable=True, sortable=True, editable=False,
+                                comparator=case_insensitive_comparator())
     gb.configure_grid_options(singleClickEdit=True, stopEditingWhenCellsLoseFocus=True)
     gb.configure_column("id", width=50)
     gb.configure_column("source_prefix", width=130)
@@ -144,7 +146,8 @@ def _payee_normalization(conn):
         cols_shown = ["id", "search_pattern", "normalized_name", "payee_suffix", "whole_word_only"]
 
         gb = GridOptionsBuilder.from_dataframe(df[cols_shown])
-        gb.configure_default_column(resizable=True, sortable=True, editable=False)
+        gb.configure_default_column(resizable=True, sortable=True, editable=False,
+                                comparator=case_insensitive_comparator())
         gb.configure_grid_options(singleClickEdit=True, stopEditingWhenCellsLoseFocus=True)
         gb.configure_column("id", width=50)
         gb.configure_column("search_pattern", editable=True, width=200)
@@ -247,7 +250,8 @@ def _payee_metadata(conn):
             df[col] = df[col].fillna("")
 
         gb = GridOptionsBuilder.from_dataframe(df)
-        gb.configure_default_column(resizable=True, sortable=True, editable=False)
+        gb.configure_default_column(resizable=True, sortable=True, editable=False,
+                                comparator=case_insensitive_comparator())
         gb.configure_grid_options(singleClickEdit=True, stopEditingWhenCellsLoseFocus=True)
         gb.configure_column("id", width=50)
         gb.configure_column("normalized_name", width=180)
@@ -344,7 +348,8 @@ def _category_master(conn):
         df["tax_flag_default"] = df["tax_flag_default"].fillna("")
 
         gb = GridOptionsBuilder.from_dataframe(df[["id", "category", "subcategory", "tax_flag_default"]])
-        gb.configure_default_column(resizable=True, sortable=True, editable=False)
+        gb.configure_default_column(resizable=True, sortable=True, editable=False,
+                                comparator=case_insensitive_comparator())
         gb.configure_grid_options(singleClickEdit=True, stopEditingWhenCellsLoseFocus=True)
         gb.configure_column("id", width=50)
         gb.configure_column("category", editable=True, width=180)
@@ -903,7 +908,8 @@ def _edit_transactions(conn):
     )
 
     gb = GridOptionsBuilder.from_dataframe(df)
-    gb.configure_default_column(resizable=True, sortable=True, editable=False)
+    gb.configure_default_column(resizable=True, sortable=True, editable=False,
+                                comparator=case_insensitive_comparator())
     gb.configure_grid_options(singleClickEdit=True,
                               stopEditingWhenCellsLoseFocus=True,
                               getRowStyle=split_row_style)

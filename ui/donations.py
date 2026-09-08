@@ -11,6 +11,7 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 from db import queries
 from ui._amount_style import (
     amount_cell_style, amount_value_formatter, format_signed_amount,
+    case_insensitive_comparator,
 )
 
 
@@ -109,7 +110,8 @@ def donations_page(conn):
     df = pd.DataFrame(data)
 
     gb = GridOptionsBuilder.from_dataframe(df)
-    gb.configure_default_column(resizable=True, sortable=True, editable=False)
+    gb.configure_default_column(resizable=True, sortable=True, editable=False,
+                                comparator=case_insensitive_comparator())
     gb.configure_grid_options(singleClickEdit=True,
                               stopEditingWhenCellsLoseFocus=True)
     gb.configure_column("id", hide=True)
