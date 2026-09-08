@@ -353,10 +353,12 @@ def _interactive_category_summary(conn):
     )
 
     # Build the flat dataframe — grouping happens client-side in AG Grid.
+    # id is carried through hidden so a Note edit knows which transaction to update.
     import pandas as pd
     rows = []
     for t in txns_no_xfer:
         rows.append({
+            "id":          t.get("id"),
             "Category":    t.get("category") or "(uncategorized)",
             "Subcategory": t.get("subcategory") or "(none)",
             "Payee":       t.get("payee") or "(no payee)",
@@ -367,17 +369,22 @@ def _interactive_category_summary(conn):
             "Note":        t.get("note") or "",
         })
     df = pd.DataFrame(rows)
+    # Snapshot the original notes so we can diff after edits and only write
+    # changed rows.
+    original_notes = {r["id"]: (r["Note"] or "") for r in rows if r["id"] is not None}
 
     # AG Grid with row grouping — one tree column, expandable at each level.
     from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
     from ui._amount_style import amount_cell_style, amount_value_formatter
 
     gb = GridOptionsBuilder.from_dataframe(df)
-    # Everything read-only, sortable + filterable (search box on each column).
+    # Default: read-only. Only the Note column overrides to editable=True below.
     gb.configure_default_column(
         resizable=True, sortable=True, editable=False, filter=True,
         suppressMenu=False,
     )
+    # id: hidden — needed to save note edits back to the correct transaction.
+    gb.configure_column("id", hide=True)
     # The three grouping levels — hide their raw columns (their values appear
     # inside the auto-generated tree column instead).
     gb.configure_column("Category",    rowGroup=True, hide=True)
@@ -394,7 +401,9 @@ def _interactive_category_summary(conn):
     gb.configure_column("Date", width=105)
     gb.configure_column("Source", width=110)
     gb.configure_column("Description", width=280)
-    gb.configure_column("Note", width=180)
+    # Note: the ONE editable field in this otherwise-read-only view. Save is
+    # explicit via the button below the grid — no auto-save.
+    gb.configure_column("Note", width=200, editable=True)
 
     gb.configure_grid_options(
         groupDisplayType="singleColumn",  # one tree column, classic drill-down
@@ -406,20 +415,48 @@ def _interactive_category_summary(conn):
         animateRows=True,
         suppressAggFuncInHeader=True,   # header just says "Amount", not "sum(Amount)"
         groupDefaultExpanded=0,          # start fully collapsed
+        headerHeight=32,                 # ensure column-header row is visible
+        singleClickEdit=True,            # one click into the Note cell to edit
+        stopEditingWhenCellsLoseFocus=True,
     )
 
-    AgGrid(
+    grid_response = AgGrid(
         df,
         gridOptions=gb.build(),
-        update_mode=GridUpdateMode.NO_UPDATE,   # read-only; no callback churn
+        update_mode=GridUpdateMode.MODEL_CHANGED,  # returns edited data
         allow_unsafe_jscode=True,
         fit_columns_on_grid_load=True,
         height=650,
+        theme="alpine-dark",             # explicit dark theme; makes headers pop
         # Row grouping (rowGroup) is an AG Grid Enterprise feature. This flag
         # loads the Enterprise bundle in evaluation mode — fine for personal
         # non-commercial use; a small watermark may appear.
         enable_enterprise_modules=True,
     )
+
+    # --- Save Note changes ---
+    col_save, col_note, _ = st.columns([1, 4, 1])
+    if col_save.button("Save Note changes", key="ics_save_notes"):
+        edited = grid_response["data"]
+        updated = 0
+        for _, row in edited.iterrows():
+            rid = row.get("id")
+            # Skip AG Grid group rows (no id) and rows with unchanged notes.
+            if pd.isna(rid):
+                continue
+            tid = int(rid)
+            new_note = (row.get("Note") or "").strip()
+            old_note = original_notes.get(tid, "")
+            if new_note != old_note:
+                queries.update_transaction(conn, tid,
+                                            note=new_note if new_note else None)
+                updated += 1
+        if updated:
+            st.success(f"Saved {updated} note change(s).")
+            st.rerun()
+        else:
+            st.info("No note changes to save.")
+    col_note.caption("Notes are editable here (the only editable field). Click **Save Note changes** to commit.")
 
 
 def _excel_export(conn):

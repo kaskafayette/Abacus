@@ -349,6 +349,29 @@ def _extract_paypal_payee(description: str) -> str | None:
     return smart_title(name)
 
 
+# ActBlue is a political-donation intermediary; the real recipient candidate is
+# embedded in the description as 'ACTBLUE* NAME' (e.g. 'ACTBLUE* MANNY.YEKUTIE').
+# Extracts to '<Recipient> (Act Blue)' so each recipient is its own payee.
+_ACTBLUE_RE = re.compile(r"^ACTBLUE\s*\*\s*(.+?)(?:\s+\d{5,}.*)?$", re.IGNORECASE)
+
+
+def _extract_actblue_payee(description: str) -> str | None:
+    """Return '<Recipient> (Act Blue)' if the description is 'ACTBLUE* NAME'."""
+    if not description or not re.match(r"ACTBLUE", description, re.IGNORECASE):
+        return None
+    m = _ACTBLUE_RE.match(description.strip())
+    if not m:
+        return None
+    raw = m.group(1).strip()
+    if not raw:
+        return None
+    # Split on dots/underscores/spaces to break 'MANNY.YEKUTIE' -> ['Manny','Yekutie']
+    parts = [smart_title(p) for p in re.split(r"[.\s_]+", raw) if p]
+    if not parts:
+        return None
+    return f"{' '.join(parts)} (Act Blue)"
+
+
 # Check with embedded payee: Chase writes 'CHECK # 1040   STATE FARM RO 08 PYMT'
 # (or 'CHECK 1040 STATE FARM'). Bare 'CHECK 1040' has no embedded payee and
 # returns None. The returned string still needs to be matched against
@@ -501,6 +524,16 @@ def normalize_transactions(conn: sqlite3.Connection, transaction_ids: list[int] 
         paypal_payee = _extract_paypal_payee(raw)
         if paypal_payee:
             queries.update_transaction(conn, row["id"], payee=paypal_payee, via="PayPal")
+            matched += 1
+            continue
+
+        # Special case: ActBlue — extract recipient from 'ACTBLUE* NAME' so each
+        # political recipient becomes its own payee (e.g.
+        # 'Manny Yekutie (Act Blue)') instead of collapsing into a single
+        # generic 'Actblue' bucket.
+        actblue_payee = _extract_actblue_payee(raw)
+        if actblue_payee:
+            queries.update_transaction(conn, row["id"], payee=actblue_payee, via="Act Blue")
             matched += 1
             continue
 
