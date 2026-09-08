@@ -237,10 +237,12 @@ def _payee_normalization(conn):
 # ---------------------------------------------------------------------------
 
 def _payee_metadata(conn):
+    import json
     st.subheader("Payee Metadata")
 
     rows = queries.get_payee_metadata(conn)
     category_names = queries.get_category_names(conn)
+    subcats_map, _ = _build_subcats_map(conn)
     payor_options = ["", "David", "Debra", "Both", "Unknown"]
 
     if rows:
@@ -248,6 +250,17 @@ def _payee_metadata(conn):
         # Replace None with empty string for display
         for col in df.columns:
             df[col] = df[col].fillna("")
+
+        # Cascading subcategory picker: Subcategory column shows only the subs
+        # valid for the row's selected Category. Uses cellEditorSelector at the
+        # top level of the column def (nested JsCode in cellEditorParams stays
+        # a string on the JS side and the dropdown ends up empty).
+        subcat_selector = JsCode(
+            "function(params){ var m=" + json.dumps(subcats_map) + ";"
+            " var c=params.data.category_override;"
+            " var vals=(c && m[c])?m[c]:[''];"
+            " return {component:'agSelectCellEditor', params:{values:vals}}; }"
+        )
 
         gb = GridOptionsBuilder.from_dataframe(df)
         gb.configure_default_column(resizable=True, sortable=True, editable=False,
@@ -258,7 +271,8 @@ def _payee_metadata(conn):
         gb.configure_column("category_override", editable=True, width=150,
                             cellEditor="agSelectCellEditor",
                             cellEditorParams={"values": [""] + category_names})
-        gb.configure_column("subcategory_override", editable=True, width=150)
+        gb.configure_column("subcategory_override", editable=True, width=150,
+                            cellEditorSelector=subcat_selector)
         tax_flag_values = [
             "", "Tax-reportable", "Reimbursable", "Capital Improvements",
             "Home Office", "Donations - Deductible", "Medical", "Business Expense",
@@ -845,7 +859,9 @@ def _edit_transactions(conn):
 
     st.caption(f"{len(rows)} transaction(s)")
 
+    import json
     category_names = queries.get_category_names(conn)
+    subcats_map, _ = _build_subcats_map(conn)
     payor_options = ["", "David", "Debra", "Both", "Unknown"]
     status_options = ["pending", "confirmed", "needs_review"]
 
@@ -922,7 +938,15 @@ def _edit_transactions(conn):
     gb.configure_column("Category", editable=not_split_editable, width=140,
                         cellEditor="agSelectCellEditor",
                         cellEditorParams={"values": [""] + category_names})
-    gb.configure_column("Subcategory", editable=not_split_editable, width=140)
+    # Cascading subcategory picker — options narrow to the row's Category.
+    subcat_selector = JsCode(
+        "function(params){ var m=" + json.dumps(subcats_map) + ";"
+        " var c=params.data.Category;"
+        " var vals=(c && m[c])?m[c]:[''];"
+        " return {component:'agSelectCellEditor', params:{values:vals}}; }"
+    )
+    gb.configure_column("Subcategory", editable=not_split_editable, width=140,
+                        cellEditorSelector=subcat_selector)
     from ui._amount_style import amount_cell_style, amount_value_formatter
     gb.configure_column("Amount", width=90,
                         type=["numericColumn"],
