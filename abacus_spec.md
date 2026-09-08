@@ -637,7 +637,24 @@ Concrete work that's queued and committed — has a clear path, just hasn't been
 
     Not urgent — the current anti-illusion surfaces work — but the friction will grow every time we add a required field. Revisit with fresh eyes.
 
-16. **Subdivide the Health and Wellness category.** Health and Wellness is currently one of the largest categories in the ledger, which makes reports on it a wall of undifferentiated line items — no way to tell at a glance how much went to hair vs. massage vs. gym. Break it into the following subcategories:
+16. **Guardrails against dangerous normalization rules.** The "Antiques for 7 vs. Main Street" incident showed that a single overly-broad rule can silently mis-label hundreds of unrelated transactions and stay undetected for months. The offending rule was `pattern="REMOTE ONLINE DEPOSIT # 1" → payee="Main Street Research"`: the pattern is bank boilerplate that appears on any teller-window deposit, and nothing in the pattern names Main Street — so every large deposit got misclassified until a manual audit found it.
+
+    Add checks in three places so this class of bug can't repeat quietly:
+
+    **(a) Rule-definition-time warning: token-overlap check.** When the user adds or edits a payee_normalization rule (in `db.queries.insert_payee_normalization` / `update_payee_normalization`, or the Maintenance grid's Commit path), compare the payee name against the pattern:
+
+      - Tokenize both to lowercase words ≥3 chars, drop stopwords (`the`, `for`, `and`, `llc`, `inc`, `co`, `com`, etc.).
+      - If no token from the payee name appears anywhere in the pattern, block the save with a red banner: *"This rule assigns `<payee>` but the pattern `<pattern>` contains no word from that name. That's how the Main Street Research vs Antiques for 7 mixup happened. Are you sure? [Save Anyway]"*
+      - Legitimate abbreviations still work: `pattern="COSTCO WHSE #123" → payee="Costco"` passes (token `costco` overlaps), `pattern="STATE FARM INSURANCE" → payee="State Farm"` passes.
+      - Escape hatch: a small "I know what I'm doing" checkbox that stores the override so re-editing the same rule doesn't nag every time.
+
+    **(b) Rule-definition-time warning: bank-boilerplate patterns.** A short curated blacklist of substrings that are so generic they should NEVER be a full pattern on their own: `REMOTE ONLINE DEPOSIT`, `DEPOSIT ID NUMBER`, `ONLINE PAYMENT`, `WIRE TRANSFER`, `ACH CREDIT`, `ATM DEPOSIT`, plain `DEPOSIT`, plain `PAYMENT`. If a saved pattern is one of these (or a trivial extension like the same string with a trailing `# 1`), warn — these are the strings that will match every batch statement wholesale.
+
+    **(c) Retroactive audit tab on Maintenance.** A new sub-tab under Payee Normalization that lists every existing rule failing check (a) or (b), sorted by "matches so far" (a join against `transactions.payee` counting how many rows currently carry the assigned payee). Each row shows the pattern, the assigned payee, the match count, and buttons `Reset matched transactions to needs_review` and `Delete rule`. That's the same recovery flow we did by hand for `REMOTE ONLINE DEPOSIT # 1` — a canned tool means the next such rule doesn't need a manual DB dive.
+
+    All three checks are heuristics, not proofs — a rule like `pattern="ACH CREDIT VANGUARD" → payee="Vanguard"` overlaps on `vanguard`, so it passes (a) even though `ACH CREDIT` is boilerplate. That's the right trade-off: (a) is the low-noise workhorse, (b) is the higher-recall catch for the specific pattern shape that failed us, and (c) closes the loop for anything already in the wild.
+
+17. **Subdivide the Health and Wellness category.** Health and Wellness is currently one of the largest categories in the ledger, which makes reports on it a wall of undifferentiated line items — no way to tell at a glance how much went to hair vs. massage vs. gym. Break it into the following subcategories:
 
     - **Hair** — cuts, color, styling.
     - **Nails** — manicures, pedicures.
