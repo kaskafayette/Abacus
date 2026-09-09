@@ -704,6 +704,30 @@ Items that would be nice to have but aren't currently planned. Re-evaluate when 
 
     Not urgent because the payor field already exists and can be populated by hand on any single row; this is the ergonomics upgrade for when payor reporting becomes something the user actually reaches for.
 
+7. **Unified "transactions view" replacing Browse + Interactive Category Summary + (maybe) Edit Transactions.** Today three pages show substantially the same rows through different lenses — Browse (flat list, sortable, one-click note-edit), Interactive Category Summary (drill-down grouping, notes auto-save inline), and Maintenance → Edit Transactions (flat list, inline edit on every field). Users routinely need to jump between them: spot a problem on the report, tab to the editor, find the row, fix it, tab back. That round-trip is expensive and easy to lose context in.
+
+    Proposed consolidation:
+
+      - **One page**, one filter panel at the top (all the current Browse filters — text search, source, status, date preset, amount range).
+      - **A view toggle** switches the results block between two shapes:
+        - **Register view** — flat chronological list of all filtered rows (Browse's shape today).
+        - **Report view** — drill-down grouping Category → Subcategory → Payee → Transactions (Interactive Category Summary's shape today), with the same green-for-credits aggregation.
+      - **Both views are read-only by default** — no accidental miscategorization from a stray click. The one exception is inline **Note** editing with auto-save (kept because notes are low-consequence, high-frequency, and today's UX works well).
+      - **Edit path**: each row has a small "Edit" button (or double-click). Clicking opens a **modal dialog** (`st.dialog`) with the full field editor (payee, category, cascading subcategory, tax flags, payor, status, amount if it's not a split, note). Confirm applies + closes; Cancel discards. Modal-only editing means "convenient but not too convenient" — a fat-finger can't rewrite a $10K row.
+      - **Diagnostics could be absorbed** — as a filter preset ("Show only unresolved / missing subcat") plus the Issue-column enrichment. Would drop the standalone tab.
+
+    Design details worth thinking through before building:
+
+      - The view toggle isn't just a re-render — AG Grid's `rowGroup` config has to be swapped in and out. Doable, but the toggle needs to preserve the current filter state (dates, source, amount range) across the transition.
+      - `st.dialog` (Streamlit's modal API) has quirks — can't easily nest, dialog state can be sticky across reruns. Prototype the edit modal on a small case (say a single-field modal that flips a status) before committing to the full redesign.
+      - Interaction with **transaction splitting**: the modal probably doesn't want to host the split-editor UI (that's a nested form). Simplest is a "Split this transaction →" button inside the modal that closes it and routes to the split tab (or opens a second, split-editor modal — pick one).
+      - Interaction with **Maintenance → Edit Transactions**: if the unified page has row-click-modal-edit, the standalone Edit tab arguably has no purpose. Might be deleted, or repurposed as the multi-select bulk-edit page (assign a category to N selected rows at once), which the modal can't do.
+      - Interaction with **the notes auto-save**: keep it. Notes are the one field where the current inline-cell workflow is clearly better than a modal for every edit.
+
+    Effort estimate: a few days of focused work — most of it is the modal editor and getting the toggle transition right; the filter panel unification is already close since Edit Transactions and Browse now share the same filter shape.
+
+    Subsumes Future Enhancement #5 (AG Grid for Browse) — the unified page uses AG Grid throughout, so the Browse-specific upgrade there is moot once this lands.
+
 ---
 
 ## Explicitly out of scope
