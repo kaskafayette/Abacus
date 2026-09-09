@@ -627,15 +627,34 @@ Concrete work that's queued and committed — has a clear path, just hasn't been
 
     **(c) Cosmetic:** for check rows with no embedded payee (bare `CHECK 1002`), blank the useless `Check` suggestion so it's obvious the user has to look at their check register, and consider rendering the Description column as `Check #1002` so the check number reads clearly.
 
-15. **Status / completeness model needs simplification.** The current design conflates two orthogonal questions into one three-value `status` column: "have you looked at this row?" (pending vs confirmed / needs_review) and "is it fully classified?" (category present, subcategory present where required, tax flag present where a default exists). We keep discovering new "clean-looking but actually incomplete" combinations — most recently: `status='confirmed' + category='Bsns Expense NEC' + subcategory=NULL`, which shows as `(none)` in reports and was silently miscategorizing Google One and GoDaddy. Each such combination has to be plumbed into a separate data-quality helper (`get_unconfirmed_count`, `get_missing_subcategory_count`, ...) and surfaced in every anti-illusion banner (sidebar, Home, PDF page 1, Interactive report). That's not sustainable — the combinatorial space of `(status × has_category × has_subcategory × has_tax_flag × has_payor × ...)` grows every time we add a required field.
+15. **Replace `status` with two orthogonal boolean flags: `needs_review` and `needs_challenge`.** The current three-value `status` column (`pending` / `confirmed` / `needs_review`) conflates two distinct classes of problem into one field, and repeatedly loses to a third — rows can be `status='confirmed'` yet still incompletely classified (missing subcategory, invalid category, etc.). The combinatorial space of `(status × has_category × has_subcategory × has_tax_flag × has_payor × ...)` grows every time a required field is added, and each new class needs its own anti-illusion helper (`get_unconfirmed_count`, `get_missing_subcategory_count`, ...) surfaced in every banner.
 
-    Directions to consider (no decision yet):
-      - **Collapse to 2 statuses** (`pending` / `confirmed`) and move `needs_review` to a separate boolean `flagged` bit. Two orthogonal fields with clear meaning: status = "did you look?", flagged = "did you set aside for follow-up?".
-      - **Add a derived `completeness` flag** on read, computed from (category != NULL) AND (subcategory != NULL when required) AND (tax_flag != NULL when a default exists). Reports and banners then check one thing, not five.
-      - **Rethink status as a workflow-step field** (imported → categorized → confirmed → filed) with explicit transitions, so every row's state is unambiguous.
-      - **Or something else** — the point is that the current model was OK for one class of "not done" (status), got extended for another class (missing subcategory), and will keep sprouting more. Worth a fresh design pass rather than more bolt-ons.
+    Cleaner model (user proposal, 2026-09-09): two independent boolean flags, either or both settable/clearable per row, absence of either flag = OK.
 
-    Not urgent — the current anti-illusion surfaces work — but the friction will grow every time we add a required field. Revisit with fresh eyes.
+    - **`needs_review`** — the bookkeeping isn't finished. Metadata is missing, wrong, or uncertain. Fixable inside the app. Auto-set when the system detects a broken row (no category, missing subcategory where required, category not in the master, etc.) OR set manually when the user notices something questionable. Rolls up today's `pending`, `needs_review`, `[need to investigate]` note tag, and the missing-subcategory data-quality issue into one bucket.
+    - **`needs_challenge`** — the transaction itself might not be right. Suspicious charge, possible fraud, disputed amount. Requires external action (call the bank, contact the merchant). The metadata may or may not also be broken; independent from `needs_review`.
+
+    Both flags composable: a suspicious $2K charge that also has a wrong category is `needs_review=True AND needs_challenge=True`. Neither flag set = "committed" — the ledger's default state.
+
+    Design points settled during discussion:
+
+    - **What replaces `status='pending'` on fresh imports.** Ingest sets `needs_review=True` on every new row; user clears it once they've vouched for the metadata. Same semantics as today's `pending → confirmed` transition, cleaner name.
+    - **Auto-clear vs manual-clear semantics.** Store a `needs_review_reason` string alongside the flag: `"auto: missing subcategory"`, `"auto: no category"`, `"auto: not yet reviewed"`, `"manual: <user's own text>"`, `"need to investigate"`. When the auto-detected reason resolves (subcategory added, category set), auto-set flags auto-clear. Manual flags stay until the user explicitly unchecks.
+    - **`needs_challenge` UI surface.** Home / Sidebar anti-illusion banners get a dedicated line (`⚠ N need review · M need challenge`). A visible badge (red icon, colored row border) on every list where the row appears — Browse, Interactive Category Summary, Diagnostics — so a challenged transaction is impossible to miss.
+    - **Migration from existing `status`.**
+      - `status='confirmed'` AND no auto-detected issue → both flags False.
+      - `status='confirmed'` AND missing subcat → `needs_review=True, reason="auto: missing subcategory"`.
+      - `status='pending'` → `needs_review=True, reason="auto: not yet reviewed"`.
+      - `status='needs_review'` → `needs_review=True, reason="manual"`.
+      - Rows whose note contains `[need to investigate]` → `needs_review=True, reason="need to investigate"`.
+      - `needs_challenge` all zero at migration; nothing sets it today.
+    - **Reports scope.** "Confirmed only" (today's PDF/Excel default) becomes `needs_review=False AND needs_challenge=False`. Single clean condition, no orthogonal completeness checks.
+    - **Anti-illusion queries collapse.** `get_unconfirmed_count` + `get_missing_subcategory_count` fold into `get_needs_review_count` + `get_needs_challenge_count`. Home / Sidebar / PDF / Interactive report each read two counts, not five.
+    - **The `[need to investigate]` note tag pattern goes away.** It was a special case of `needs_review` — becomes a flag row with `reason="need to investigate"`.
+
+    Scope of the change (rough): schema migration, ingest, normalization, all the anti-illusion count queries, Diagnostics, Reports scope filter, Home banner, Sidebar banner, Edit Transactions grid, PDF generation. Not small — a solid day of focused work plus a shakedown period — but every additional required field we add before doing this makes it more expensive.
+
+    Not blocking anything right now, but explicitly queued as the next model-level cleanup after the current feature backlog quiets down.
 
 16. **Guardrails against dangerous normalization rules.** The "Antiques for 7 vs. Main Street" incident showed that a single overly-broad rule can silently mis-label hundreds of unrelated transactions and stay undetected for months. The offending rule was `pattern="REMOTE ONLINE DEPOSIT # 1" → payee="Main Street Research"`: the pattern is bank boilerplate that appears on any teller-window deposit, and nothing in the pattern names Main Street — so every large deposit got misclassified until a manual audit found it.
 
